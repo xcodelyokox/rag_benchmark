@@ -4,11 +4,14 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="rag_benchmark.sh"
-VERSION="2026.05.12"
+VERSION="2026.05.12-3"
 
 RAGBENCH_HOME="${RAGBENCH_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/rag_benchmark}"
 VENV_DIR="${RAGBENCH_VENV_DIR:-$RAGBENCH_HOME/venv}"
 INSTALL=1
+SYSTEM_INSTALL="${RAGBENCH_SYSTEM_INSTALL:-1}"
+case "${SYSTEM_INSTALL,,}" in 0|false|no|off) SYSTEM_INSTALL=0 ;; *) SYSTEM_INSTALL=1 ;; esac
+FORCE_RECREATE_VENV=0
 FORCE_TUI=0
 PLAIN=0
 EXTRA_PIP=""
@@ -39,15 +42,18 @@ rag_benchmark.sh - permissive-license RAG benchmark for OpenAI-compatible chat e
 
 Common usage:
   ./rag_benchmark.sh --endpoint http://127.0.0.1:8000/v1 --model MODEL_ID --quick
-  curl -fsSL https://raw.githubusercontent.com/user/rag_benchmark/main/rag_benchmark.sh | bash
-  curl -fsSL https://raw.githubusercontent.com/user/rag_benchmark/main/rag_benchmark.sh | bash -s -- --endpoint http://127.0.0.1:8000/v1 --model MODEL_ID
+  curl -fsSL https://raw.githubusercontent.com/xcodelyokox/rag_benchmark/main/rag_benchmark.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/xcodelyokox/rag_benchmark/main/rag_benchmark.sh | bash -s -- --endpoint http://127.0.0.1:8000/v1 --model MODEL_ID
 
 When run with no arguments from a terminal, the script launches an interactive TUI wizard.
 The wizard works even when the script itself is piped through stdin, because prompts read from /dev/tty.
 
 Bootstrap options handled by Bash:
   --tui                    Force the interactive terminal wizard.
-  --no-install             Do not create/use a virtualenv or install packages.
+  --no-install             Do not create/use a virtualenv, install pip packages, or run apt bootstrap.
+  --system-install          Allow apt-based system dependency bootstrap. Default on.
+  --no-system-install       Disable apt/sudo bootstrap; fail with repair instructions instead.
+  --recreate-venv           Remove and rebuild the benchmark virtualenv before running.
   --venv-dir DIR           Virtualenv directory. Default: $RAGBENCH_HOME/venv
   --state-dir DIR          Cache/venv root. Useful for CI tests. Default: ~/.cache/rag_benchmark
   --extra-pip "PKGS"       Extra packages appended to pip install.
@@ -78,7 +84,10 @@ Environment shortcuts:
   OPENAI_API_KEY           Used as bearer token unless --api-key is supplied.
   RAGBENCH_HOME            Cache root for curl|bash runs. Default: ~/.cache/rag_benchmark
 
-Direct benchmark Python packages installed by default:
+System packages checked on apt-based WSL/Ubuntu when install mode is enabled:
+  ca-certificates, curl, python3, python3-venv, python3-pip; python3-full/python3-numpy as repair fallbacks
+
+Direct benchmark Python packages installed by default into the venv:
   bootstrap tools: pip, setuptools, wheel
   runtime packages: numpy, faiss-cpu
 USAGE
@@ -112,6 +121,19 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-install)
       INSTALL=0
+      SYSTEM_INSTALL=0
+      shift
+      ;;
+    --system-install)
+      SYSTEM_INSTALL=1
+      shift
+      ;;
+    --no-system-install)
+      SYSTEM_INSTALL=0
+      shift
+      ;;
+    --recreate-venv)
+      FORCE_RECREATE_VENV=1
       shift
       ;;
     --venv-dir)
@@ -218,12 +240,12 @@ render_tui() {
   local output="./rag_benchmark_result_$(date +%Y%m%d_%H%M%S).json"
   local index_backend="auto"
   local cache_dir="$RAGBENCH_HOME/cache"
-  local choice secret install_label plain_label profile_label
+  local choice secret install_label plain_label profile_label system_label
 
   if ! has_tty_in; then
     say "No interactive terminal is available for the TUI."
     say "Provide --endpoint, or set RAG_ENDPOINT, e.g.:"
-    say "  curl -fsSL URL | RAG_ENDPOINT=http://127.0.0.1:8000/v1 RAG_MODEL=my-model bash"
+    say "  curl -fsSL https://raw.githubusercontent.com/xcodelyokox/rag_benchmark/main/rag_benchmark.sh | RAG_ENDPOINT=http://127.0.0.1:8000/v1 RAG_MODEL=my-model bash"
     exit 2
   fi
 
@@ -234,7 +256,12 @@ render_tui() {
       custom) profile_label="custom" ;;
       *) profile_label="$profile" ;;
     esac
-    if [[ "$INSTALL" -eq 1 ]]; then install_label="venv install on"; else install_label="no install"; fi
+    if [[ "$INSTALL" -eq 1 ]]; then
+      if [[ "$SYSTEM_INSTALL" -eq 1 ]]; then install_label="auto-bootstrap + venv"; else install_label="venv only"; fi
+    else
+      install_label="no install"
+    fi
+    if [[ "$SYSTEM_INSTALL" -eq 1 ]]; then system_label="apt bootstrap on"; else system_label="apt bootstrap off"; fi
     if [[ "$PLAIN" -eq 1 ]]; then plain_label="plain output"; else plain_label="styled TUI"; fi
 
     clear_tty
@@ -250,7 +277,7 @@ render_tui() {
     printf '  %-2s %-22s %s%s\n' '8)' 'Corpus' "$corpus" "${corpus_file:+ file=$corpus_file license=$corpus_license}" > /dev/tty
     printf '  %-2s %-22s %s\n' '9)' 'Output JSON' "$output" > /dev/tty
     printf '  %-2s %-22s backend=%s max_tokens=%s stream=%s\n' '10)' 'Advanced' "$index_backend" "$max_tokens" "$stream_mode" > /dev/tty
-    printf '  %-2s %-22s %s, %s\n' '11)' 'Runtime' "$install_label" "$plain_label" > /dev/tty
+    printf '  %-2s %-22s %s, %s, %s\n' '11)' 'Runtime' "$system_label" "$install_label" "$plain_label" > /dev/tty
     printf '  %-2s %-22s %s\n' 'L)' 'License audit' 'show permissive dependency/corpus posture' > /dev/tty
     printf '  %-2s %-22s %s\n' 'T)' 'Self-test' 'run local mock OpenAI-compatible endpoint' > /dev/tty
     printf '  %-2s %-22s %s\n' 'S)' 'Start benchmark' 'run now' > /dev/tty
@@ -340,11 +367,16 @@ render_tui() {
       11)
         clear_tty
         say_tty "Runtime options:"
-        say_tty "  1) Use/create venv and install numpy faiss-cpu"
-        say_tty "  2) No install; use current Python environment"
+        say_tty "  1) Auto-bootstrap WSL2 system deps + use/create venv"
+        say_tty "  2) Use/create venv only, no apt/sudo bootstrap"
+        say_tty "  3) No install; use current Python environment"
         printf 'Choice: ' > /dev/tty
         IFS= read -r choice < /dev/tty || choice=""
-        case "$choice" in 2) INSTALL=0 ;; *) INSTALL=1 ;; esac
+        case "$choice" in
+          2) INSTALL=1; SYSTEM_INSTALL=0 ;;
+          3) INSTALL=0; SYSTEM_INSTALL=0 ;;
+          *) INSTALL=1; SYSTEM_INSTALL=1 ;;
+        esac
         clear_tty
         say_tty "Terminal style:"
         say_tty "  1) Styled TUI output"
@@ -408,44 +440,213 @@ if [[ "$PLAIN" -eq 1 ]] && ! has_arg "--plain" "${PY_ARGS[@]}"; then
   PY_ARGS+=("--plain")
 fi
 
+requires_faiss_backend() {
+  local prev="" x
+  for x in "${PY_ARGS[@]}"; do
+    if [[ "$prev" == "--index-backend" && "$x" == "faiss" ]]; then return 0; fi
+    if [[ "$x" == "--index-backend=faiss" ]]; then return 0; fi
+    prev="$x"
+  done
+  return 1
+}
+
+unique_words() {
+  awk 'NF && !seen[$0]++'
+}
+
+is_debian_apt_system() {
+  command -v apt-get >/dev/null 2>&1 && command -v dpkg-query >/dev/null 2>&1
+}
+
+pkg_installed() {
+  local pkg="$1"
+  dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"
+}
+
+run_as_root() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+ensure_sudo_ready() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then return 0; fi
+  if ! command -v sudo >/dev/null 2>&1; then
+    echo "sudo is required to install missing system packages. Re-run as root, install sudo, or use --no-system-install." >&2
+    return 1
+  fi
+  if has_tty_in; then
+    sudo -v < /dev/tty
+  else
+    sudo -n true
+  fi
+}
+
+apt_install_packages() {
+  local pkgs=("$@")
+  if [[ ${#pkgs[@]} -eq 0 ]]; then return 0; fi
+  if [[ "$SYSTEM_INSTALL" -ne 1 ]]; then
+    echo "Missing system packages: ${pkgs[*]}" >&2
+    echo "System installation is disabled. Re-run without --no-system-install, or install manually:" >&2
+    echo "  sudo apt-get update && sudo apt-get install -y ${pkgs[*]}" >&2
+    return 1
+  fi
+  if ! is_debian_apt_system; then
+    echo "Missing system packages: ${pkgs[*]}" >&2
+    echo "Automatic bootstrap currently supports apt-based WSL2/Ubuntu/Debian systems." >&2
+    echo "Install the equivalent packages manually, or provide --no-install with a ready Python environment." >&2
+    return 1
+  fi
+  bold; say "Preflight: installing/repairing system packages: ${pkgs[*]}"; resetc
+  ensure_sudo_ready || return 1
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get update
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${pkgs[@]}"
+}
+
+ensure_writable_dir() {
+  local dir="$1" probe
+  mkdir -p "$dir" || { echo "Could not create directory: $dir" >&2; exit 1; }
+  probe="$dir/.ragbench-write-test.$$"
+  if ! : > "$probe" 2>/dev/null; then
+    echo "Directory is not writable: $dir" >&2
+    exit 1
+  fi
+  rm -f "$probe"
+}
+
+python_can_create_venv() {
+  local py="$1" tmp
+  tmp="${TMPDIR:-/tmp}/ragbench-venv-probe.$$"
+  rm -rf "$tmp"
+  if "$py" -m venv "$tmp" >/dev/null 2>&1; then
+    rm -rf "$tmp"
+    return 0
+  fi
+  rm -rf "$tmp"
+  return 1
+}
+
+ensure_system_prereqs() {
+  # Re-check the host every run. Fresh WSL2 images often lack python3-venv/pip.
+  if [[ "$INSTALL" -eq 0 ]]; then return 0; fi
+
+  local missing=()
+  if ! command -v python3 >/dev/null 2>&1; then
+    missing+=(ca-certificates curl python3 python3-venv python3-pip)
+  else
+    if ! python_can_create_venv "$(command -v python3)"; then
+      missing+=(python3-venv)
+    fi
+    if ! python3 -m pip --version >/dev/null 2>&1; then
+      missing+=(python3-pip)
+    fi
+    if is_debian_apt_system && ! pkg_installed ca-certificates; then
+      missing+=(ca-certificates)
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+      missing+=(curl)
+    fi
+    if is_debian_apt_system && ! pkg_installed curl; then
+      missing+=(curl)
+    fi
+  fi
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    mapfile -t missing < <(printf '%s\n' "${missing[@]}" | unique_words)
+    apt_install_packages "${missing[@]}" || exit 1
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required and could not be installed automatically." >&2
+    echo "On WSL2/Ubuntu, install it with:" >&2
+    echo "  sudo apt-get update && sudo apt-get install -y ca-certificates curl python3 python3-venv python3-pip" >&2
+    exit 1
+  fi
+}
+
+ensure_system_prereqs
+
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "python3 is required. In WSL2, install it with:" >&2
-  echo "  sudo apt update && sudo apt install -y python3 python3-venv python3-pip" >&2
+  echo "python3 is required. Re-run without --no-install, or install it manually:" >&2
+  echo "  sudo apt-get update && sudo apt-get install -y ca-certificates curl python3 python3-venv python3-pip" >&2
   exit 1
 fi
 SYSTEM_PYTHON="$(command -v python3)"
 
-# License audit and help-like metadata can run without installing benchmark packages.
-SKIP_INSTALL=0
-if has_arg "--license-audit" "${PY_ARGS[@]}"; then SKIP_INSTALL=1; fi
+# License audit can run with the system Python after the system prereq check; it does not need pip packages.
+SKIP_PIP_INSTALL=0
+if has_arg "--license-audit" "${PY_ARGS[@]}"; then SKIP_PIP_INSTALL=1; fi
 
-PYTHON_BIN="python3"
-if [[ "$INSTALL" -eq 1 && "$SKIP_INSTALL" -eq 0 ]]; then
-  mkdir -p "$RAGBENCH_HOME"
-  if [[ ! -d "$VENV_DIR" ]]; then
-    bold; say "Creating Python virtualenv: $VENV_DIR"; resetc
-    if ! python3 -m venv "$VENV_DIR"; then
-      echo "Could not create virtualenv. On WSL2/Ubuntu, install:" >&2
-      echo "  sudo apt update && sudo apt install -y python3-venv python3-pip" >&2
-      exit 1
+PYTHON_BIN="$SYSTEM_PYTHON"
+if [[ "$INSTALL" -eq 1 && "$SKIP_PIP_INSTALL" -eq 0 ]]; then
+  ensure_writable_dir "$RAGBENCH_HOME"
+
+  if [[ "$FORCE_RECREATE_VENV" -eq 1 && -d "$VENV_DIR" ]]; then
+    yellow; say "Preflight: --recreate-venv requested; removing: $VENV_DIR"; resetc
+    rm -rf "$VENV_DIR"
+  fi
+
+
+  VENV_BROKEN=0
+  if [[ -d "$VENV_DIR" ]]; then
+    if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+      VENV_BROKEN=1
+    elif ! "$VENV_DIR/bin/python" - <<'PY_VALIDATE_VENV' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.prefix != sys.base_prefix else 1)
+PY_VALIDATE_VENV
+    then
+      VENV_BROKEN=1
     fi
   fi
-  # shellcheck disable=SC1091
-  source "$VENV_DIR/bin/activate"
-  PYTHON_BIN="python"
-  bold; say "Installing/updating permissive benchmark packages in $VENV_DIR"; resetc
-  PIP_TIMEOUT="${RAGBENCH_PIP_TIMEOUT:-20}"
-  PIP_RETRIES="${RAGBENCH_PIP_RETRIES:-1}"
+
+  if [[ "$VENV_BROKEN" -eq 1 ]]; then
+    yellow; say "Preflight: removing stale or broken virtualenv: $VENV_DIR"; resetc
+    rm -rf "$VENV_DIR"
+  fi
+
+  if [[ ! -d "$VENV_DIR" ]]; then
+    bold; say "Preflight: creating Python virtualenv: $VENV_DIR"; resetc
+    if ! "$SYSTEM_PYTHON" -m venv "$VENV_DIR"; then
+      yellow; say "Preflight: venv creation failed; attempting python3-full repair."; resetc
+      apt_install_packages python3-full python3-venv python3-pip || exit 1
+      "$SYSTEM_PYTHON" -m venv "$VENV_DIR" || { echo "Could not create virtualenv after repair: $VENV_DIR" >&2; exit 1; }
+    fi
+  fi
+
+  PYTHON_BIN="$VENV_DIR/bin/python"
+  if ! "$PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
+    yellow; say "Preflight: pip missing in virtualenv; running ensurepip."; resetc
+    if ! "$PYTHON_BIN" -m ensurepip --upgrade >/dev/null 2>&1; then
+      yellow; say "Preflight: ensurepip failed; recreating virtualenv."; resetc
+      rm -rf "$VENV_DIR"
+      "$SYSTEM_PYTHON" -m venv "$VENV_DIR" || { echo "Could not recreate virtualenv: $VENV_DIR" >&2; exit 1; }
+      PYTHON_BIN="$VENV_DIR/bin/python"
+    fi
+  fi
+
+  if ! "$PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
+    echo "pip is required inside the virtualenv and could not be repaired." >&2
+    echo "Try: sudo apt-get update && sudo apt-get install -y python3-venv python3-pip python3-full" >&2
+    exit 1
+  fi
+
+  bold; say "Preflight: checking Python packages in $VENV_DIR"; resetc
+  PIP_TIMEOUT="${RAGBENCH_PIP_TIMEOUT:-60}"
+  PIP_RETRIES="${RAGBENCH_PIP_RETRIES:-3}"
   PIP_INSTALL=("$PYTHON_BIN" -m pip --disable-pip-version-check --no-input --timeout "$PIP_TIMEOUT" --retries "$PIP_RETRIES" install --upgrade)
 
   if ! "${PIP_INSTALL[@]}" pip setuptools wheel; then
-    echo "warning: pip bootstrap upgrade failed; continuing with the existing pip tooling." >&2
+    echo "warning: pip/bootstrap upgrade failed; continuing with existing pip tooling." >&2
   fi
 
   if ! "$PYTHON_BIN" - <<'PY_CHECK_NUMPY' >/dev/null 2>&1
 import numpy
 PY_CHECK_NUMPY
   then
+    bold; say "Preflight: installing missing Python package: numpy"; resetc
     if ! "${PIP_INSTALL[@]}" numpy; then
       echo "warning: numpy installation failed inside the venv." >&2
     fi
@@ -455,16 +656,19 @@ PY_CHECK_NUMPY
 import numpy
 PY_CHECK_NUMPY2
   then
+    if [[ "$SYSTEM_INSTALL" -eq 1 ]]; then
+      yellow; say "Preflight: trying apt fallback for NumPy."; resetc
+      apt_install_packages python3-numpy || true
+    fi
     if "$SYSTEM_PYTHON" - <<'PY_CHECK_SYS_NUMPY' >/dev/null 2>&1
 import numpy
 PY_CHECK_SYS_NUMPY
     then
       echo "warning: using system python because numpy is unavailable in the venv." >&2
-      deactivate >/dev/null 2>&1 || true
       PYTHON_BIN="$SYSTEM_PYTHON"
     else
       echo "numpy is required and could not be imported or installed." >&2
-      echo "Install it manually, or re-run with network access: python3 -m pip install numpy" >&2
+      echo "Re-run with network access, or install manually: python3 -m pip install numpy" >&2
       exit 1
     fi
   fi
@@ -476,7 +680,12 @@ PY_CHECK_SYS_NUMPY
 import faiss
 PY_CHECK_FAISS
   then
+    bold; say "Preflight: installing optional Python package: faiss-cpu"; resetc
     if ! "${PIP_INSTALL[@]}" faiss-cpu; then
+      if requires_faiss_backend; then
+        echo "faiss-cpu is required because --index-backend faiss was selected, but installation failed." >&2
+        exit 1
+      fi
       echo "warning: faiss-cpu installation failed; NumPy fallback will be used unless --index-backend faiss is requested." >&2
     fi
   fi
@@ -485,6 +694,17 @@ PY_CHECK_FAISS
     # shellcheck disable=SC2206
     EXTRA_PKGS=( $EXTRA_PIP )
     "${PIP_INSTALL[@]}" "${EXTRA_PKGS[@]}"
+  fi
+else
+  # --no-install or --license-audit: still verify that the selected Python exists.
+  if [[ "$SKIP_PIP_INSTALL" -eq 0 ]]; then
+    if ! "$PYTHON_BIN" - <<'PY_CHECK_NO_INSTALL_NUMPY' >/dev/null 2>&1
+import numpy
+PY_CHECK_NO_INSTALL_NUMPY
+    then
+      echo "numpy is required in --no-install mode. Install it manually or re-run without --no-install." >&2
+      exit 1
+    fi
   fi
 fi
 
@@ -519,7 +739,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-VERSION = "2026.05.12"
+VERSION = "2026.05.12-3"
 DIRECT_LICENSES = [
     {"component": "rag_benchmark.sh", "license": "MIT", "role": "script", "source": "this file"},
     {"component": "synthetic RAG corpus", "license": "MIT-compatible generated fixture", "role": "default corpus", "source": "generated locally; no third-party source text"},
