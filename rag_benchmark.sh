@@ -1,29 +1,26 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# rag_benchmark.sh - permissive-license RAG benchmark for OpenAI-compatible chat endpoints.
+# rag_benchmark.sh - deterministic X3D-style RAG benchmark for OpenAI-compatible endpoints.
 set -Eeuo pipefail
 
 SCRIPT_NAME="rag_benchmark.sh"
-VERSION="2026.05.12-3"
+VERSION="2026.05.12-5-x3d100k"
+GITHUB_RAW_URL="https://raw.githubusercontent.com/xcodelyokox/rag_benchmark/main/rag_benchmark.sh"
 
 RAGBENCH_HOME="${RAGBENCH_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/rag_benchmark}"
 VENV_DIR="${RAGBENCH_VENV_DIR:-$RAGBENCH_HOME/venv}"
 INSTALL=1
-SYSTEM_INSTALL="${RAGBENCH_SYSTEM_INSTALL:-1}"
-case "${SYSTEM_INSTALL,,}" in 0|false|no|off) SYSTEM_INSTALL=0 ;; *) SYSTEM_INSTALL=1 ;; esac
-FORCE_RECREATE_VENV=0
+SYSTEM_INSTALL=1
+RECREATE_VENV=0
 FORCE_TUI=0
 PLAIN=0
 EXTRA_PIP=""
 PY_ARGS=()
-SHOW_BASH_HELP=0
+ORIGINAL_ARGC=$#
 
-is_tty() { [[ -t 1 ]]; }
-has_tty_in() { [[ -e /dev/tty ]] && ( : < /dev/tty ) >/dev/null 2>&1 && ( : > /dev/tty ) >/dev/null 2>&1; }
-
-ansi() {
-  if [[ "$PLAIN" -eq 0 ]] && is_tty; then printf '\033[%sm' "$1"; fi
-}
+is_tty_out() { [[ -t 1 ]]; }
+has_tty() { [[ -e /dev/tty ]] && ( : < /dev/tty ) >/dev/null 2>&1 && ( : > /dev/tty ) >/dev/null 2>&1; }
+ansi() { if [[ "$PLAIN" -eq 0 ]] && is_tty_out; then printf '\033[%sm' "$1"; fi; }
 resetc() { ansi 0; }
 bold() { ansi 1; }
 dim() { ansi 2; }
@@ -34,685 +31,348 @@ red() { ansi 31; }
 blue() { ansi 34; }
 
 say() { printf '%s\n' "$*"; }
-say_tty() { if has_tty_in; then printf '%s\n' "$*" > /dev/tty; else printf '%s\n' "$*"; fi; }
+info() { printf '%s\n' "$(cyan)[$SCRIPT_NAME]$(resetc) $*"; }
+warn() { printf '%s\n' "$(yellow)[$SCRIPT_NAME warning]$(resetc) $*" >&2; }
+die() { printf '%s\n' "$(red)[$SCRIPT_NAME error]$(resetc) $*" >&2; exit 1; }
 
 usage() {
-  cat <<'USAGE'
-rag_benchmark.sh - permissive-license RAG benchmark for OpenAI-compatible chat endpoints
+  cat <<USAGE
+rag_benchmark.sh $VERSION
+Deterministic X3D-style RAG benchmark for OpenAI-compatible chat endpoints.
 
-Common usage:
-  ./rag_benchmark.sh --endpoint http://127.0.0.1:8000/v1 --model MODEL_ID --quick
-  curl -fsSL https://raw.githubusercontent.com/xcodelyokox/rag_benchmark/main/rag_benchmark.sh | bash
-  curl -fsSL https://raw.githubusercontent.com/xcodelyokox/rag_benchmark/main/rag_benchmark.sh | bash -s -- --endpoint http://127.0.0.1:8000/v1 --model MODEL_ID
+Curl-pipe interactive TUI:
+  curl -fsSL $GITHUB_RAW_URL | bash
 
-When run with no arguments from a terminal, the script launches an interactive TUI wizard.
-The wizard works even when the script itself is piped through stdin, because prompts read from /dev/tty.
+Non-interactive examples:
+  curl -fsSL $GITHUB_RAW_URL | bash -s -- --endpoint http://127.0.0.1:8000/v1 --model MODEL_ID
+  ./rag_benchmark.sh --endpoint http://127.0.0.1:8000/v1 --model MODEL_ID --profile x3d-100k
+  ./rag_benchmark.sh --self-test --plain
 
-Bootstrap options handled by Bash:
+What the default profile measures:
+  1. [x3d-rag-benchmark] Batch Search 100K (QPS)
+  2. [x3d-rag-benchmark] Index Build 100K (seconds + vec/s)
+  3. [x3d-rag-benchmark] Throughput (req/s)
+
+Bash/bootstrap options:
   --tui                    Force the interactive terminal wizard.
-  --no-install             Do not create/use a virtualenv, install pip packages, or run apt bootstrap.
-  --system-install          Allow apt-based system dependency bootstrap. Default on.
-  --no-system-install       Disable apt/sudo bootstrap; fail with repair instructions instead.
-  --recreate-venv           Remove and rebuild the benchmark virtualenv before running.
-  --venv-dir DIR           Virtualenv directory. Default: $RAGBENCH_HOME/venv
-  --state-dir DIR          Cache/venv root. Useful for CI tests. Default: ~/.cache/rag_benchmark
+  --no-install             Use current Python only; do not create venv, pip install, or apt install.
+  --system-install         Allow apt-based fresh WSL2 dependency bootstrap. Default.
+  --no-system-install      Do not run apt/sudo; only create/repair venv and pip packages.
+  --recreate-venv          Delete and recreate the benchmark virtualenv.
+  --state-dir DIR          Cache/venv root. Default: ~/.cache/rag_benchmark
+  --venv-dir DIR           Virtualenv directory. Default: ~/.cache/rag_benchmark/venv
   --extra-pip "PKGS"       Extra packages appended to pip install.
-  --plain                  Disable colors and live terminal styling.
+  --plain                  Disable colors/live styling.
   -h, --help               Show this help.
 
 Benchmark options passed to Python:
   --endpoint URL           OpenAI-compatible base URL, with or without /v1.
   --model ID               Model id. If omitted, GET /v1/models is used when available.
-  --api-key KEY            Bearer token. Default: OPENAI_API_KEY, or EMPTY.
-  --quick                  Small smoke profile.
-  --db-sizes LIST          Comma-separated vector DB sizes, e.g. 10000,50000,100000.
-  --rag-workers N          Concurrent RAG workers. Default: min(cpu_count, 8).
-  --rag-runs N             Repeated concurrent RAG runs.
-  --rag-queries-per-worker N
+  --api-key KEY            Bearer token. Default: OPENAI_API_KEY, or empty.
+  --profile NAME           x3d-100k (default), quick, or custom.
+  --quick                  Alias for --profile quick.
+  --db-sizes LIST          Comma-separated DB sizes. Default x3d-100k: 100000.
+  --batch-queries N        Batch vector-search queries per timed run. Default: 3000.
+  --runs N                 Batch-search timed runs. Default: 10.
+  --build-runs N           Index-build timed runs. Default: 5.
+  --rag-workers N          Concurrent RAG workers. Default x3d-100k: fixed 8.
+  --rag-runs N             Repeated concurrent RAG runs. Default: 5.
+  --rag-queries-per-worker N  RAG requests per worker per run. Default: 20.
+  --rag-db-size N          Per-worker RAG retrieval index size. Default: 10000.
+  --label NAME             Label used in terminal charts and result JSON.
   --output FILE            JSON result path.
-  --cache-dir DIR          Corpus and embedding cache dir.
-  --corpus synthetic       Default. Locally generated MIT-compatible synthetic fixture.
-  --corpus local-jsonl     User-provided JSONL corpus; requires --corpus-license.
-  --corpus-file FILE       JSONL path when --corpus local-jsonl.
-  --corpus-license SPDX    Required for local-jsonl. Must be permissive.
+  --cache-dir DIR          Embedding/cache directory. Default: ~/.cache/rag_benchmark/cache
+  --index-backend NAME     faiss (default), auto, or numpy. X3D-comparable runs require faiss.
+  --seed N                 Master deterministic workload seed. Default: 1337.
   --license-audit          Print dependency/corpus license posture and exit.
   --self-test              Run against a local mock OpenAI-compatible endpoint.
 
+Fresh WSL2 note:
+  The exact curl one-liner requires curl to already exist. After the script starts, it can
+  install or repair Python, python3-venv, python3-pip, NumPy, and faiss-cpu on apt-based WSL2.
+
 Environment shortcuts:
-  RAG_ENDPOINT             Used as --endpoint when no endpoint argument is supplied.
-  RAG_MODEL                Used as --model when no model argument is supplied.
+  RAG_ENDPOINT             Used when --endpoint is omitted.
+  RAG_MODEL                Used when --model is omitted.
   OPENAI_API_KEY           Used as bearer token unless --api-key is supplied.
-  RAGBENCH_HOME            Cache root for curl|bash runs. Default: ~/.cache/rag_benchmark
-
-System packages checked on apt-based WSL/Ubuntu when install mode is enabled:
-  ca-certificates, curl, python3, python3-venv, python3-pip; python3-full/python3-numpy as repair fallbacks
-
-Direct benchmark Python packages installed by default into the venv:
-  bootstrap tools: pip, setuptools, wheel
-  runtime packages: numpy, faiss-cpu
+  RAGBENCH_HOME            Cache root. Default: ~/.cache/rag_benchmark
 USAGE
 }
 
-has_arg() {
-  local needle="$1"; shift || true
-  local x
-  for x in "$@"; do
-    if [[ "$x" == "$needle" || "$x" == "$needle="* ]]; then return 0; fi
-  done
-  return 1
-}
-
-has_endpoint_arg() {
-  local prev="" x
-  for x in "$@"; do
-    if [[ "$prev" == "--endpoint" ]]; then return 0; fi
-    if [[ "$x" == --endpoint=* ]]; then return 0; fi
-    if [[ "$x" == http://* || "$x" == https://* ]]; then return 0; fi
-    prev="$x"
-  done
-  return 1
-}
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --tui)
-      FORCE_TUI=1
-      shift
-      ;;
-    --no-install)
-      INSTALL=0
-      SYSTEM_INSTALL=0
-      shift
-      ;;
-    --system-install)
-      SYSTEM_INSTALL=1
-      shift
-      ;;
-    --no-system-install)
-      SYSTEM_INSTALL=0
-      shift
-      ;;
-    --recreate-venv)
-      FORCE_RECREATE_VENV=1
-      shift
-      ;;
-    --venv-dir)
-      if [[ $# -lt 2 ]]; then echo "Missing value for --venv-dir" >&2; exit 2; fi
-      VENV_DIR="$2"
-      shift 2
-      ;;
-    --state-dir)
-      if [[ $# -lt 2 ]]; then echo "Missing value for --state-dir" >&2; exit 2; fi
-      RAGBENCH_HOME="$2"
-      VENV_DIR="${RAGBENCH_VENV_DIR:-$RAGBENCH_HOME/venv}"
-      shift 2
-      ;;
-    --extra-pip)
-      if [[ $# -lt 2 ]]; then echo "Missing value for --extra-pip" >&2; exit 2; fi
-      EXTRA_PIP="$2"
-      shift 2
-      ;;
-    --plain)
-      PLAIN=1
-      PY_ARGS+=("--plain")
-      shift
-      ;;
-    -h|--help)
-      SHOW_BASH_HELP=1
-      shift
-      ;;
-    *)
-      PY_ARGS+=("$1")
-      shift
-      ;;
-  esac
-done
-
-if [[ "$SHOW_BASH_HELP" -eq 1 ]]; then
-  usage
-  exit 0
-fi
-
-clear_tty() {
-  if [[ "$PLAIN" -eq 0 ]] && has_tty_in; then printf '\033[2J\033[H' > /dev/tty; fi
-}
-
-box_line() {
-  local width="$1" char="$2"
-  printf '+%*s+\n' "$((width - 2))" '' | tr ' ' "$char"
-}
-
-center_text() {
-  local text="$1" width="$2" pad left right
-  if (( ${#text} >= width - 2 )); then printf '| %s |\n' "${text:0:$((width-4))}"; return; fi
-  pad=$((width - 2 - ${#text}))
-  left=$((pad / 2))
-  right=$((pad - left))
-  printf '|%*s%s%*s|\n' "$left" '' "$text" "$right" ''
-}
-
 prompt_tty() {
-  local label="$1" default="${2:-}" value
-  if [[ -n "$default" ]]; then
-    printf '%s [%s]: ' "$label" "$default" > /dev/tty
-  else
-    printf '%s: ' "$label" > /dev/tty
+  local prompt="$1" default="${2:-}" answer
+  if ! has_tty; then
+    die "Interactive prompt requested but /dev/tty is unavailable. Re-run with explicit --endpoint/--model options."
   fi
-  IFS= read -r value < /dev/tty || value=""
-  if [[ -z "$value" ]]; then value="$default"; fi
-  printf '%s' "$value"
-}
-
-prompt_secret_tty() {
-  local label="$1" value
-  printf '%s: ' "$label" > /dev/tty
-  IFS= read -rs value < /dev/tty || value=""
-  printf '\n' > /dev/tty
-  printf '%s' "$value"
+  if [[ -n "$default" ]]; then
+    printf '%s [%s]: ' "$prompt" "$default" > /dev/tty
+  else
+    printf '%s: ' "$prompt" > /dev/tty
+  fi
+  IFS= read -r answer < /dev/tty || answer=""
+  if [[ -z "$answer" ]]; then
+    printf '%s' "$default"
+  else
+    printf '%s' "$answer"
+  fi
 }
 
 pause_tty() {
-  printf '\nPress Enter to continue...' > /dev/tty
-  IFS= read -r _ < /dev/tty || true
+  if has_tty; then
+    printf 'Press Enter to continue...' > /dev/tty
+    IFS= read -r _ < /dev/tty || true
+  fi
 }
 
-render_tui() {
-  local endpoint="${RAG_ENDPOINT:-${OPENAI_BASE_URL:-}}"
-  local model="${RAG_MODEL:-${OPENAI_MODEL:-}}"
-  local api_mode="env"
-  local profile="quick"
-  local db_sizes="10000"
-  local batch_queries="300"
-  local runs="3"
-  local rag_workers="2"
-  local rag_runs="2"
-  local rag_qpw="5"
-  local rag_db_size="5000"
-  local top_k="5"
-  local max_tokens="80"
-  local context_chars="1200"
-  local request_timeout="120"
-  local temperature="0"
-  local stream_mode="yes"
-  local corpus="synthetic"
-  local corpus_file=""
-  local corpus_license=""
-  local output="./rag_benchmark_result_$(date +%Y%m%d_%H%M%S).json"
-  local index_backend="auto"
-  local cache_dir="$RAGBENCH_HOME/cache"
-  local choice secret install_label plain_label profile_label system_label
-
-  if ! has_tty_in; then
-    say "No interactive terminal is available for the TUI."
-    say "Provide --endpoint, or set RAG_ENDPOINT, e.g.:"
-    say "  curl -fsSL https://raw.githubusercontent.com/xcodelyokox/rag_benchmark/main/rag_benchmark.sh | RAG_ENDPOINT=http://127.0.0.1:8000/v1 RAG_MODEL=my-model bash"
-    exit 2
+tui_draw() {
+  local endpoint="$1" model="$2" profile="$3" label="$4" output="$5" runtime="$6" api_mode="$7" index_backend="$8"
+  if has_tty; then
+    printf '\033[2J\033[H' > /dev/tty || true
+    {
+      printf '%s\n' "$(bold)$(cyan)rag_benchmark.sh $VERSION$(resetc)"
+      printf '%s\n' "Deterministic X3D-style RAG benchmark for OpenAI-compatible endpoints"
+      printf '\n'
+      printf '  %-2s %-22s %s\n' '1)' 'Endpoint' "${endpoint:-<auto from RAG_ENDPOINT / required>}"
+      printf '  %-2s %-22s %s\n' '2)' 'Model' "${model:-<auto-detect from /v1/models>}"
+      printf '  %-2s %-22s %s\n' '3)' 'API key' "$api_mode"
+      printf '  %-2s %-22s %s\n' '4)' 'Profile' "$profile"
+      printf '  %-2s %-22s %s\n' '5)' 'Result label' "$label"
+      printf '  %-2s %-22s %s\n' '6)' 'Output JSON' "$output"
+      printf '  %-2s %-22s %s\n' '7)' 'Runtime install mode' "$runtime"
+      printf '  %-2s %-22s %s\n' '8)' 'Index backend' "$index_backend"
+      printf '\n'
+      printf '  %-2s %s\n' 'r)' 'Run benchmark'
+      printf '  %-2s %s\n' 't)' 'Run local self-test instead of real endpoint'
+      printf '  %-2s %s\n' 'l)' 'License audit'
+      printf '  %-2s %s\n' 'h)' 'Help'
+      printf '  %-2s %s\n' 'q)' 'Quit'
+      printf '\n'
+      printf 'Choice: '
+    } > /dev/tty
   fi
+}
 
+launch_tui() {
+  if ! has_tty; then
+    usage
+    die "No arguments were supplied and /dev/tty is unavailable, so the interactive TUI cannot run."
+  fi
+  local endpoint="${RAG_ENDPOINT:-}"
+  local model="${RAG_MODEL:-}"
+  local profile="x3d-100k"
+  local label="$(hostname 2>/dev/null || printf 'this-system')"
+  local output="./rag_benchmark_result_$(date +%Y%m%d_%H%M%S).json"
+  local runtime="full preflight with apt/sudo + venv"
+  local api_mode="OPENAI_API_KEY env or empty"
+  local api_key_arg=""
+  local index_backend="faiss"
+  local choice
   while true; do
-    case "$profile" in
-      quick) profile_label="quick smoke" ;;
-      standard) profile_label="standard" ;;
-      custom) profile_label="custom" ;;
-      *) profile_label="$profile" ;;
-    esac
-    if [[ "$INSTALL" -eq 1 ]]; then
-      if [[ "$SYSTEM_INSTALL" -eq 1 ]]; then install_label="auto-bootstrap + venv"; else install_label="venv only"; fi
-    else
-      install_label="no install"
-    fi
-    if [[ "$SYSTEM_INSTALL" -eq 1 ]]; then system_label="apt bootstrap on"; else system_label="apt bootstrap off"; fi
-    if [[ "$PLAIN" -eq 1 ]]; then plain_label="plain output"; else plain_label="styled TUI"; fi
-
-    clear_tty
-    { cyan; box_line 78 '='; center_text "RAG BENCHMARK LAUNCHER" 78; center_text "OpenAI-compatible endpoint + local permissive RAG corpus" 78; box_line 78 '='; resetc; } > /dev/tty
-    printf '\n' > /dev/tty
-    printf '  %-2s %-22s %s\n' '1)' 'Endpoint URL' "${endpoint:-<required>}" > /dev/tty
-    printf '  %-2s %-22s %s\n' '2)' 'Model ID' "${model:-<auto-detect from /v1/models>}" > /dev/tty
-    printf '  %-2s %-22s %s\n' '3)' 'API key' "$api_mode" > /dev/tty
-    printf '  %-2s %-22s %s\n' '4)' 'Run profile' "$profile_label" > /dev/tty
-    printf '  %-2s %-22s %s\n' '5)' 'Vector DB sizes' "$db_sizes" > /dev/tty
-    printf '  %-2s %-22s batch=%s runs=%s top_k=%s\n' '6)' 'Search settings' "$batch_queries" "$runs" "$top_k" > /dev/tty
-    printf '  %-2s %-22s workers=%s runs=%s q/worker=%s rag_db=%s\n' '7)' 'Concurrent RAG' "$rag_workers" "$rag_runs" "$rag_qpw" "$rag_db_size" > /dev/tty
-    printf '  %-2s %-22s %s%s\n' '8)' 'Corpus' "$corpus" "${corpus_file:+ file=$corpus_file license=$corpus_license}" > /dev/tty
-    printf '  %-2s %-22s %s\n' '9)' 'Output JSON' "$output" > /dev/tty
-    printf '  %-2s %-22s backend=%s max_tokens=%s stream=%s\n' '10)' 'Advanced' "$index_backend" "$max_tokens" "$stream_mode" > /dev/tty
-    printf '  %-2s %-22s %s, %s, %s\n' '11)' 'Runtime' "$system_label" "$install_label" "$plain_label" > /dev/tty
-    printf '  %-2s %-22s %s\n' 'L)' 'License audit' 'show permissive dependency/corpus posture' > /dev/tty
-    printf '  %-2s %-22s %s\n' 'T)' 'Self-test' 'run local mock OpenAI-compatible endpoint' > /dev/tty
-    printf '  %-2s %-22s %s\n' 'S)' 'Start benchmark' 'run now' > /dev/tty
-    printf '  %-2s %-22s %s\n' 'Q)' 'Quit' 'exit without running' > /dev/tty
-    printf '\nChoose an option: ' > /dev/tty
-    IFS= read -r choice < /dev/tty || choice=""
-    case "${choice,,}" in
-      1)
-        endpoint="$(prompt_tty 'OpenAI-compatible endpoint URL' "$endpoint")"
-        ;;
-      2)
-        model="$(prompt_tty 'Model ID (blank = auto-detect)' "$model")"
-        ;;
+    tui_draw "$endpoint" "$model" "$profile" "$label" "$output" "$runtime" "$api_mode" "$index_backend"
+    IFS= read -r choice < /dev/tty || choice="q"
+    case "$choice" in
+      1) endpoint="$(prompt_tty 'OpenAI-compatible endpoint URL' "${endpoint:-http://127.0.0.1:8000/v1}")" ;;
+      2) model="$(prompt_tty 'Model id (blank = auto-detect)' "$model")" ;;
       3)
-        clear_tty
-        say_tty "API key mode:"
-        say_tty "  1) Use OPENAI_API_KEY from environment (default)"
-        say_tty "  2) Send EMPTY token"
-        say_tty "  3) Type/paste key now (hidden; exported only for this run)"
-        printf 'Choice: ' > /dev/tty
-        IFS= read -r choice < /dev/tty || choice=""
-        case "$choice" in
-          2) api_mode="empty"; export OPENAI_API_KEY="EMPTY" ;;
-          3) secret="$(prompt_secret_tty 'API key')"; export OPENAI_API_KEY="$secret"; api_mode="prompted" ;;
-          *) api_mode="env" ;;
-        esac
-        ;;
+         local key
+         key="$(prompt_tty 'API key (blank = OPENAI_API_KEY env or no bearer token)' '')"
+         if [[ -n "$key" ]]; then api_key_arg="$key"; api_mode="provided in TUI"; else api_key_arg=""; api_mode="OPENAI_API_KEY env or empty"; fi
+         ;;
       4)
-        clear_tty
-        say_tty "Profiles:"
-        say_tty "  1) quick    - smoke test, low cost"
-        say_tty "  2) standard - broader local retrieval benchmark"
-        say_tty "  3) custom   - keep current values and edit manually"
-        printf 'Choice: ' > /dev/tty
-        IFS= read -r choice < /dev/tty || choice=""
-        case "$choice" in
-          2) profile="standard"; db_sizes="50000,100000"; batch_queries="1000"; runs="5"; rag_workers="4"; rag_runs="3"; rag_qpw="10"; rag_db_size="10000"; top_k="10" ;;
-          3) profile="custom" ;;
-          *) profile="quick"; db_sizes="10000"; batch_queries="300"; runs="3"; rag_workers="2"; rag_runs="2"; rag_qpw="5"; rag_db_size="5000"; top_k="5" ;;
-        esac
-        ;;
-      5)
-        profile="custom"
-        db_sizes="$(prompt_tty 'Comma-separated DB sizes' "$db_sizes")"
-        ;;
-      6)
-        profile="custom"
-        batch_queries="$(prompt_tty 'Batch vector-search queries per run' "$batch_queries")"
-        runs="$(prompt_tty 'Repeated runs' "$runs")"
-        top_k="$(prompt_tty 'Top-k retrieval' "$top_k")"
-        ;;
+         printf 'Profiles:\n  1) x3d-100k: 100K vectors, 3000-query batch, 10 search runs, 5 build runs, 8-worker RAG\n  2) quick: small smoke run\n  3) custom: you will pass additional flags after download/run\nSelect profile [1]: ' > /dev/tty
+         IFS= read -r p < /dev/tty || p="1"
+         case "${p:-1}" in 2) profile="quick" ;; 3) profile="custom" ;; *) profile="x3d-100k" ;; esac
+         ;;
+      5) label="$(prompt_tty 'Chart/result label' "$label")" ;;
+      6) output="$(prompt_tty 'Output JSON path' "$output")" ;;
       7)
-        profile="custom"
-        rag_workers="$(prompt_tty 'Concurrent RAG workers' "$rag_workers")"
-        rag_runs="$(prompt_tty 'RAG repeated runs' "$rag_runs")"
-        rag_qpw="$(prompt_tty 'RAG queries per worker per run' "$rag_qpw")"
-        rag_db_size="$(prompt_tty 'RAG DB size' "$rag_db_size")"
-        ;;
+         printf 'Runtime modes:\n  1) full preflight with apt/sudo + venv (fresh WSL2 default)\n  2) venv/pip only, no apt/sudo\n  3) no install, use current Python\nSelect mode [1]: ' > /dev/tty
+         IFS= read -r m < /dev/tty || m="1"
+         case "${m:-1}" in
+           2) runtime="venv/pip only, no apt/sudo"; INSTALL=1; SYSTEM_INSTALL=0 ;;
+           3) runtime="no install, current Python"; INSTALL=0; SYSTEM_INSTALL=0 ;;
+           *) runtime="full preflight with apt/sudo + venv"; INSTALL=1; SYSTEM_INSTALL=1 ;;
+         esac
+         ;;
       8)
-        clear_tty
-        say_tty "Corpus options:"
-        say_tty "  1) synthetic   - generated locally, no third-party source text (default)"
-        say_tty "  2) local-jsonl - your own JSONL with a permissive SPDX license declaration"
-        printf 'Choice: ' > /dev/tty
-        IFS= read -r choice < /dev/tty || choice=""
-        case "$choice" in
-          2)
-            corpus="local-jsonl"
-            corpus_file="$(prompt_tty 'JSONL corpus file path' "$corpus_file")"
-            corpus_license="$(prompt_tty 'Corpus SPDX license (MIT/Apache-2.0/BSD-3-Clause/CC0-1.0/etc.)' "$corpus_license")"
-            ;;
-          *) corpus="synthetic"; corpus_file=""; corpus_license="" ;;
-        esac
-        ;;
-      9)
-        output="$(prompt_tty 'Output JSON path' "$output")"
-        ;;
-      10)
-        index_backend="$(prompt_tty 'Index backend (auto/faiss/numpy)' "$index_backend")"
-        max_tokens="$(prompt_tty 'Max generation tokens per request' "$max_tokens")"
-        context_chars="$(prompt_tty 'Context characters per request' "$context_chars")"
-        temperature="$(prompt_tty 'Temperature' "$temperature")"
-        request_timeout="$(prompt_tty 'Request timeout seconds' "$request_timeout")"
-        stream_mode="$(prompt_tty 'Use streaming for TTFT? (yes/no)' "$stream_mode")"
-        cache_dir="$(prompt_tty 'Cache directory' "$cache_dir")"
-        ;;
-      11)
-        clear_tty
-        say_tty "Runtime options:"
-        say_tty "  1) Auto-bootstrap WSL2 system deps + use/create venv"
-        say_tty "  2) Use/create venv only, no apt/sudo bootstrap"
-        say_tty "  3) No install; use current Python environment"
-        printf 'Choice: ' > /dev/tty
-        IFS= read -r choice < /dev/tty || choice=""
-        case "$choice" in
-          2) INSTALL=1; SYSTEM_INSTALL=0 ;;
-          3) INSTALL=0; SYSTEM_INSTALL=0 ;;
-          *) INSTALL=1; SYSTEM_INSTALL=1 ;;
-        esac
-        clear_tty
-        say_tty "Terminal style:"
-        say_tty "  1) Styled TUI output"
-        say_tty "  2) Plain CI-safe output"
-        printf 'Choice: ' > /dev/tty
-        IFS= read -r choice < /dev/tty || choice=""
-        case "$choice" in 2) PLAIN=1 ;; *) PLAIN=0 ;; esac
-        ;;
-      l)
-        PY_ARGS=("--license-audit")
-        if [[ "$PLAIN" -eq 1 ]]; then PY_ARGS+=("--plain"); fi
-        return
-        ;;
-      t)
-        PY_ARGS=("--self-test" "--output" "./rag_benchmark_selftest_result_$(date +%Y%m%d_%H%M%S).json" "--cache-dir" "$cache_dir" "--index-backend" "$index_backend")
-        if [[ "$PLAIN" -eq 1 ]]; then PY_ARGS+=("--plain"); fi
-        return
-        ;;
-      s)
-        if [[ -z "$endpoint" ]]; then
-          red > /dev/tty; say_tty "Endpoint URL is required."; resetc > /dev/tty; pause_tty
-          continue
-        fi
-        PY_ARGS=("--endpoint" "$endpoint" "--output" "$output" "--cache-dir" "$cache_dir" "--db-sizes" "$db_sizes" "--batch-queries" "$batch_queries" "--runs" "$runs" "--top-k" "$top_k" "--rag-workers" "$rag_workers" "--rag-runs" "$rag_runs" "--rag-queries-per-worker" "$rag_qpw" "--rag-db-size" "$rag_db_size" "--corpus" "$corpus" "--index-backend" "$index_backend" "--max-tokens" "$max_tokens" "--context-chars" "$context_chars" "--temperature" "$temperature" "--request-timeout" "$request_timeout")
-        case "${stream_mode,,}" in n|no|false|0) PY_ARGS+=("--no-stream") ;; esac
-        if [[ -n "$model" ]]; then PY_ARGS+=("--model" "$model"); fi
-        if [[ "$profile" == "quick" ]]; then PY_ARGS+=("--quick"); fi
-        if [[ "$corpus" == "local-jsonl" ]]; then PY_ARGS+=("--corpus-file" "$corpus_file" "--corpus-license" "$corpus_license"); fi
-        if [[ "$PLAIN" -eq 1 ]]; then PY_ARGS+=("--plain"); fi
-        return
-        ;;
-      q)
-        exit 0
-        ;;
+         printf 'Index backends:\n  1) faiss - X3D-comparable HNSW path (recommended)\n  2) auto - FAISS if available, otherwise NumPy smoke fallback\n  3) numpy - smoke fallback, not X3D-comparable\nSelect backend [1]: ' > /dev/tty
+         IFS= read -r b < /dev/tty || b="1"
+         case "${b:-1}" in 2) index_backend="auto" ;; 3) index_backend="numpy" ;; *) index_backend="faiss" ;; esac
+         ;;
+      h) usage > /dev/tty; pause_tty ;;
+      l) PY_ARGS=("--license-audit"); [[ "$PLAIN" -eq 1 ]] && PY_ARGS+=("--plain"); return ;;
+      t) PY_ARGS=("--self-test" "--profile" "quick" "--label" "self-test" "--output" "./rag_benchmark_selftest_$(date +%Y%m%d_%H%M%S).json" "--index-backend" "auto"); [[ "$PLAIN" -eq 1 ]] && PY_ARGS+=("--plain"); return ;;
+      r)
+         if [[ -z "$endpoint" ]]; then
+           endpoint="$(prompt_tty 'OpenAI-compatible endpoint URL' "http://127.0.0.1:8000/v1")"
+         fi
+         PY_ARGS=("--endpoint" "$endpoint" "--profile" "$profile" "--label" "$label" "--output" "$output" "--index-backend" "$index_backend")
+         [[ -n "$model" ]] && PY_ARGS+=("--model" "$model")
+         [[ -n "$api_key_arg" ]] && PY_ARGS+=("--api-key" "$api_key_arg")
+         [[ "$PLAIN" -eq 1 ]] && PY_ARGS+=("--plain")
+         return
+         ;;
+      q|Q) exit 0 ;;
       *) ;;
     esac
   done
 }
 
-# If the user supplies no endpoint/model args, curl|bash should still be a complete experience.
-if [[ "$FORCE_TUI" -eq 1 ]] || { ! has_endpoint_arg "${PY_ARGS[@]}" && ! has_arg "--self-test" "${PY_ARGS[@]}" && ! has_arg "--license-audit" "${PY_ARGS[@]}"; }; then
-  if [[ "$FORCE_TUI" -eq 1 ]]; then
-    render_tui
-  elif [[ -n "${RAG_ENDPOINT:-}" ]]; then
-    PY_ARGS=("--endpoint" "$RAG_ENDPOINT" "${PY_ARGS[@]}")
-    if [[ -n "${RAG_MODEL:-}" ]] && ! has_arg "--model" "${PY_ARGS[@]}"; then PY_ARGS+=("--model" "$RAG_MODEL"); fi
-  elif [[ ${#PY_ARGS[@]} -eq 0 ]]; then
-    render_tui
-  elif has_tty_in; then
-    render_tui
-  else
-    usage >&2
-    exit 2
-  fi
-fi
-
-if [[ -n "${RAG_MODEL:-}" ]] && ! has_arg "--model" "${PY_ARGS[@]}"; then
-  PY_ARGS+=("--model" "$RAG_MODEL")
-fi
-if [[ "$PLAIN" -eq 1 ]] && ! has_arg "--plain" "${PY_ARGS[@]}"; then
-  PY_ARGS+=("--plain")
-fi
-
-requires_faiss_backend() {
-  local prev="" x
-  for x in "${PY_ARGS[@]}"; do
-    if [[ "$prev" == "--index-backend" && "$x" == "faiss" ]]; then return 0; fi
-    if [[ "$x" == "--index-backend=faiss" ]]; then return 0; fi
-    prev="$x"
-  done
-  return 1
-}
-
-unique_words() {
-  awk 'NF && !seen[$0]++'
-}
-
-is_debian_apt_system() {
-  command -v apt-get >/dev/null 2>&1 && command -v dpkg-query >/dev/null 2>&1
-}
-
-pkg_installed() {
-  local pkg="$1"
-  dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"
-}
-
-run_as_root() {
-  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-    "$@"
-  else
-    sudo "$@"
-  fi
-}
-
-ensure_sudo_ready() {
-  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then return 0; fi
-  if ! command -v sudo >/dev/null 2>&1; then
-    echo "sudo is required to install missing system packages. Re-run as root, install sudo, or use --no-system-install." >&2
-    return 1
-  fi
-  if has_tty_in; then
-    sudo -v < /dev/tty
-  else
-    sudo -n true
-  fi
-}
-
 apt_install_packages() {
   local pkgs=("$@")
-  if [[ ${#pkgs[@]} -eq 0 ]]; then return 0; fi
-  if [[ "$SYSTEM_INSTALL" -ne 1 ]]; then
-    echo "Missing system packages: ${pkgs[*]}" >&2
-    echo "System installation is disabled. Re-run without --no-system-install, or install manually:" >&2
-    echo "  sudo apt-get update && sudo apt-get install -y ${pkgs[*]}" >&2
+  [[ ${#pkgs[@]} -eq 0 ]] && return 0
+  if [[ "$SYSTEM_INSTALL" -eq 0 ]]; then
+    warn "Missing system packages: ${pkgs[*]}; --no-system-install is active."
     return 1
   fi
-  if ! is_debian_apt_system; then
-    echo "Missing system packages: ${pkgs[*]}" >&2
-    echo "Automatic bootstrap currently supports apt-based WSL2/Ubuntu/Debian systems." >&2
-    echo "Install the equivalent packages manually, or provide --no-install with a ready Python environment." >&2
-    return 1
+  command -v apt-get >/dev/null 2>&1 || return 1
+  info "Installing missing system packages with apt: ${pkgs[*]}"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${pkgs[@]}"
+  else
+    if ! command -v sudo >/dev/null 2>&1; then
+      warn "sudo is unavailable; cannot apt install: ${pkgs[*]}"
+      return 1
+    fi
+    sudo -v
+    sudo apt-get update
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${pkgs[@]}"
   fi
-  bold; say "Preflight: installing/repairing system packages: ${pkgs[*]}"; resetc
-  ensure_sudo_ready || return 1
-  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get update
-  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${pkgs[@]}"
 }
 
-ensure_writable_dir() {
-  local dir="$1" probe
-  mkdir -p "$dir" || { echo "Could not create directory: $dir" >&2; exit 1; }
-  probe="$dir/.ragbench-write-test.$$"
-  if ! : > "$probe" 2>/dev/null; then
-    echo "Directory is not writable: $dir" >&2
-    exit 1
+ensure_system_dependencies() {
+  [[ "$INSTALL" -eq 0 ]] && return 0
+  mkdir -p "$RAGBENCH_HOME"
+  local missing=()
+  command -v ca-certificates >/dev/null 2>&1 || true
+  command -v curl >/dev/null 2>&1 || missing+=(curl)
+  command -v python3 >/dev/null 2>&1 || missing+=(python3)
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    apt_install_packages ca-certificates "${missing[@]}" || true
   fi
-  rm -f "$probe"
+  if ! command -v python3 >/dev/null 2>&1; then
+    die "python3 is still missing. Install Python 3, then re-run."
+  fi
+  if ! python3 -m venv --help >/dev/null 2>&1; then
+    apt_install_packages python3-venv python3-pip || true
+  fi
+  if ! python3 -m venv --help >/dev/null 2>&1; then
+    apt_install_packages python3-full || true
+  fi
+  if ! python3 -m venv --help >/dev/null 2>&1; then
+    die "python3 venv support is unavailable. Install python3-venv or python3-full, then re-run."
+  fi
 }
 
-python_can_create_venv() {
-  local py="$1" tmp
-  tmp="${TMPDIR:-/tmp}/ragbench-venv-probe.$$"
-  rm -rf "$tmp"
-  if "$py" -m venv "$tmp" >/dev/null 2>&1; then
-    rm -rf "$tmp"
+ensure_venv() {
+  if [[ "$INSTALL" -eq 0 ]]; then
+    if command -v python3 >/dev/null 2>&1; then
+      PYTHON_BIN="$(command -v python3)"
+    elif command -v python >/dev/null 2>&1; then
+      PYTHON_BIN="$(command -v python)"
+    else
+      die "No Python executable found and --no-install was requested."
+    fi
+    export PYTHON_BIN
     return 0
   fi
-  rm -rf "$tmp"
-  return 1
-}
 
-ensure_system_prereqs() {
-  # Re-check the host every run. Fresh WSL2 images often lack python3-venv/pip.
-  if [[ "$INSTALL" -eq 0 ]]; then return 0; fi
-
-  local missing=()
-  if ! command -v python3 >/dev/null 2>&1; then
-    missing+=(ca-certificates curl python3 python3-venv python3-pip)
-  else
-    if ! python_can_create_venv "$(command -v python3)"; then
-      missing+=(python3-venv)
-    fi
-    if ! python3 -m pip --version >/dev/null 2>&1; then
-      missing+=(python3-pip)
-    fi
-    if is_debian_apt_system && ! pkg_installed ca-certificates; then
-      missing+=(ca-certificates)
-    fi
-    if ! command -v curl >/dev/null 2>&1; then
-      missing+=(curl)
-    fi
-    if is_debian_apt_system && ! pkg_installed curl; then
-      missing+=(curl)
-    fi
-  fi
-
-  if [[ ${#missing[@]} -gt 0 ]]; then
-    mapfile -t missing < <(printf '%s\n' "${missing[@]}" | unique_words)
-    apt_install_packages "${missing[@]}" || exit 1
-  fi
-
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "python3 is required and could not be installed automatically." >&2
-    echo "On WSL2/Ubuntu, install it with:" >&2
-    echo "  sudo apt-get update && sudo apt-get install -y ca-certificates curl python3 python3-venv python3-pip" >&2
-    exit 1
-  fi
-}
-
-ensure_system_prereqs
-
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "python3 is required. Re-run without --no-install, or install it manually:" >&2
-  echo "  sudo apt-get update && sudo apt-get install -y ca-certificates curl python3 python3-venv python3-pip" >&2
-  exit 1
-fi
-SYSTEM_PYTHON="$(command -v python3)"
-
-# License audit can run with the system Python after the system prereq check; it does not need pip packages.
-SKIP_PIP_INSTALL=0
-if has_arg "--license-audit" "${PY_ARGS[@]}"; then SKIP_PIP_INSTALL=1; fi
-
-PYTHON_BIN="$SYSTEM_PYTHON"
-if [[ "$INSTALL" -eq 1 && "$SKIP_PIP_INSTALL" -eq 0 ]]; then
-  ensure_writable_dir "$RAGBENCH_HOME"
-
-  if [[ "$FORCE_RECREATE_VENV" -eq 1 && -d "$VENV_DIR" ]]; then
-    yellow; say "Preflight: --recreate-venv requested; removing: $VENV_DIR"; resetc
+  mkdir -p "$(dirname "$VENV_DIR")"
+  if [[ "$RECREATE_VENV" -eq 1 && -d "$VENV_DIR" ]]; then
+    info "Recreating virtualenv: $VENV_DIR"
     rm -rf "$VENV_DIR"
   fi
-
-
-  VENV_BROKEN=0
-  if [[ -d "$VENV_DIR" ]]; then
-    if [[ ! -x "$VENV_DIR/bin/python" ]]; then
-      VENV_BROKEN=1
-    elif ! "$VENV_DIR/bin/python" - <<'PY_VALIDATE_VENV' >/dev/null 2>&1
-import sys
-raise SystemExit(0 if sys.prefix != sys.base_prefix else 1)
-PY_VALIDATE_VENV
-    then
-      VENV_BROKEN=1
-    fi
-  fi
-
-  if [[ "$VENV_BROKEN" -eq 1 ]]; then
-    yellow; say "Preflight: removing stale or broken virtualenv: $VENV_DIR"; resetc
+  if [[ -d "$VENV_DIR" && ! -x "$VENV_DIR/bin/python" ]]; then
+    warn "Virtualenv appears broken; recreating: $VENV_DIR"
     rm -rf "$VENV_DIR"
   fi
-
   if [[ ! -d "$VENV_DIR" ]]; then
-    bold; say "Preflight: creating Python virtualenv: $VENV_DIR"; resetc
-    if ! "$SYSTEM_PYTHON" -m venv "$VENV_DIR"; then
-      yellow; say "Preflight: venv creation failed; attempting python3-full repair."; resetc
-      apt_install_packages python3-full python3-venv python3-pip || exit 1
-      "$SYSTEM_PYTHON" -m venv "$VENV_DIR" || { echo "Could not create virtualenv after repair: $VENV_DIR" >&2; exit 1; }
-    fi
+    info "Creating virtualenv: $VENV_DIR"
+    python3 -m venv "$VENV_DIR" || {
+      warn "venv creation failed; trying apt repair."
+      apt_install_packages python3-venv python3-full python3-pip || true
+      python3 -m venv "$VENV_DIR"
+    }
   fi
-
   PYTHON_BIN="$VENV_DIR/bin/python"
+  export PYTHON_BIN
+  "$PYTHON_BIN" -m ensurepip --upgrade >/dev/null 2>&1 || true
   if ! "$PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
-    yellow; say "Preflight: pip missing in virtualenv; running ensurepip."; resetc
-    if ! "$PYTHON_BIN" -m ensurepip --upgrade >/dev/null 2>&1; then
-      yellow; say "Preflight: ensurepip failed; recreating virtualenv."; resetc
-      rm -rf "$VENV_DIR"
-      "$SYSTEM_PYTHON" -m venv "$VENV_DIR" || { echo "Could not recreate virtualenv: $VENV_DIR" >&2; exit 1; }
-      PYTHON_BIN="$VENV_DIR/bin/python"
-    fi
+    warn "pip is missing inside venv; recreating virtualenv."
+    rm -rf "$VENV_DIR"
+    python3 -m venv "$VENV_DIR"
+    PYTHON_BIN="$VENV_DIR/bin/python"
+    export PYTHON_BIN
+    "$PYTHON_BIN" -m ensurepip --upgrade >/dev/null 2>&1 || true
   fi
-
-  if ! "$PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
-    echo "pip is required inside the virtualenv and could not be repaired." >&2
-    echo "Try: sudo apt-get update && sudo apt-get install -y python3-venv python3-pip python3-full" >&2
-    exit 1
-  fi
-
-  bold; say "Preflight: checking Python packages in $VENV_DIR"; resetc
-  PIP_TIMEOUT="${RAGBENCH_PIP_TIMEOUT:-60}"
-  PIP_RETRIES="${RAGBENCH_PIP_RETRIES:-3}"
-  PIP_INSTALL=("$PYTHON_BIN" -m pip --disable-pip-version-check --no-input --timeout "$PIP_TIMEOUT" --retries "$PIP_RETRIES" install --upgrade)
-
-  if ! "${PIP_INSTALL[@]}" pip setuptools wheel; then
-    echo "warning: pip/bootstrap upgrade failed; continuing with existing pip tooling." >&2
-  fi
-
-  if ! "$PYTHON_BIN" - <<'PY_CHECK_NUMPY' >/dev/null 2>&1
+  "$PYTHON_BIN" -m pip install --upgrade pip setuptools wheel >/dev/null
+  if ! "$PYTHON_BIN" - <<'PY' >/dev/null 2>&1
 import numpy
-PY_CHECK_NUMPY
+PY
   then
-    bold; say "Preflight: installing missing Python package: numpy"; resetc
-    if ! "${PIP_INSTALL[@]}" numpy; then
-      echo "warning: numpy installation failed inside the venv." >&2
-    fi
+    info "Installing Python package: numpy"
+    "$PYTHON_BIN" -m pip install --upgrade numpy
   fi
-
-  if ! "$PYTHON_BIN" - <<'PY_CHECK_NUMPY2' >/dev/null 2>&1
-import numpy
-PY_CHECK_NUMPY2
-  then
-    if [[ "$SYSTEM_INSTALL" -eq 1 ]]; then
-      yellow; say "Preflight: trying apt fallback for NumPy."; resetc
-      apt_install_packages python3-numpy || true
-    fi
-    if "$SYSTEM_PYTHON" - <<'PY_CHECK_SYS_NUMPY' >/dev/null 2>&1
-import numpy
-PY_CHECK_SYS_NUMPY
-    then
-      echo "warning: using system python because numpy is unavailable in the venv." >&2
-      PYTHON_BIN="$SYSTEM_PYTHON"
-    else
-      echo "numpy is required and could not be imported or installed." >&2
-      echo "Re-run with network access, or install manually: python3 -m pip install numpy" >&2
-      exit 1
-    fi
-  fi
-
-  # FAISS is MIT licensed and enables the HNSW build/search path. If it cannot be
-  # installed, the Python runner falls back to an exact NumPy index unless
-  # --index-backend faiss is explicitly requested.
-  if ! "$PYTHON_BIN" - <<'PY_CHECK_FAISS' >/dev/null 2>&1
+  if ! "$PYTHON_BIN" - <<'PY' >/dev/null 2>&1
 import faiss
-PY_CHECK_FAISS
+PY
   then
-    bold; say "Preflight: installing optional Python package: faiss-cpu"; resetc
-    if ! "${PIP_INSTALL[@]}" faiss-cpu; then
-      if requires_faiss_backend; then
-        echo "faiss-cpu is required because --index-backend faiss was selected, but installation failed." >&2
-        exit 1
-      fi
-      echo "warning: faiss-cpu installation failed; NumPy fallback will be used unless --index-backend faiss is requested." >&2
+    info "Installing Python package: faiss-cpu"
+    if ! "$PYTHON_BIN" -m pip install --upgrade faiss-cpu; then
+      warn "faiss-cpu install failed. The benchmark can still run only with --index-backend numpy/auto quick fallback; X3D-comparable runs need FAISS."
     fi
   fi
-
   if [[ -n "$EXTRA_PIP" ]]; then
-    # shellcheck disable=SC2206
-    EXTRA_PKGS=( $EXTRA_PIP )
-    "${PIP_INSTALL[@]}" "${EXTRA_PKGS[@]}"
+    info "Installing extra pip packages: $EXTRA_PIP"
+    # shellcheck disable=SC2086
+    "$PYTHON_BIN" -m pip install --upgrade $EXTRA_PIP
   fi
-else
-  # --no-install or --license-audit: still verify that the selected Python exists.
-  if [[ "$SKIP_PIP_INSTALL" -eq 0 ]]; then
-    if ! "$PYTHON_BIN" - <<'PY_CHECK_NO_INSTALL_NUMPY' >/dev/null 2>&1
-import numpy
-PY_CHECK_NO_INSTALL_NUMPY
-    then
-      echo "numpy is required in --no-install mode. Install it manually or re-run without --no-install." >&2
-      exit 1
-    fi
-  fi
+}
+
+parse_bash_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) usage; exit 0 ;;
+      --tui) FORCE_TUI=1; shift ;;
+      --plain) PLAIN=1; PY_ARGS+=("--plain"); shift ;;
+      --no-install) INSTALL=0; SYSTEM_INSTALL=0; shift ;;
+      --system-install) SYSTEM_INSTALL=1; shift ;;
+      --no-system-install) SYSTEM_INSTALL=0; shift ;;
+      --recreate-venv) RECREATE_VENV=1; shift ;;
+      --state-dir)
+        [[ $# -ge 2 ]] || die "--state-dir requires a directory"
+        RAGBENCH_HOME="$2"; VENV_DIR="$RAGBENCH_HOME/venv"; PY_ARGS+=("--cache-dir" "$RAGBENCH_HOME/cache"); shift 2 ;;
+      --venv-dir)
+        [[ $# -ge 2 ]] || die "--venv-dir requires a directory"
+        VENV_DIR="$2"; shift 2 ;;
+      --extra-pip)
+        [[ $# -ge 2 ]] || die "--extra-pip requires a package string"
+        EXTRA_PIP="$2"; shift 2 ;;
+      *) PY_ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+
+parse_bash_args "$@"
+if [[ "$FORCE_TUI" -eq 1 || "$ORIGINAL_ARGC" -eq 0 ]]; then
+  launch_tui
 fi
+
+ensure_system_dependencies
+ensure_venv
+export PYTHONHASHSEED=0
+export OMP_DYNAMIC=FALSE
+export RAGBENCH_HOME
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rag-benchmark.XXXXXX")"
-trap 'rm -rf "$WORK_DIR"' EXIT
-RUNNER="$WORK_DIR/runner.py"
+RUNNER="$WORK_DIR/rag_benchmark_runner.py"
+cleanup() { rm -rf "$WORK_DIR"; }
+trap cleanup EXIT
 
-cat > "$RUNNER" <<'PYTHON'
+cat > "$RUNNER" <<'PY'
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 from __future__ import annotations
 
 import argparse
@@ -720,7 +380,6 @@ import concurrent.futures
 import datetime as _dt
 import gc
 import hashlib
-import http.server
 import json
 import math
 import os
@@ -728,453 +387,267 @@ import platform
 import random
 import re
 import socket
-import socketserver
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-VERSION = "2026.05.12-3"
-DIRECT_LICENSES = [
-    {"component": "rag_benchmark.sh", "license": "MIT", "role": "script", "source": "this file"},
-    {"component": "synthetic RAG corpus", "license": "MIT-compatible generated fixture", "role": "default corpus", "source": "generated locally; no third-party source text"},
-    {"component": "Python", "license": "PSF-2.0", "role": "runtime", "source": "system/venv interpreter"},
-    {"component": "pip", "license": "MIT", "role": "package installer bootstrap", "source": "pip package pip"},
-    {"component": "setuptools", "license": "MIT", "role": "package build/install bootstrap", "source": "pip package setuptools"},
-    {"component": "wheel", "license": "MIT", "role": "package wheel support bootstrap", "source": "pip package wheel"},
-    {"component": "NumPy", "license": "BSD-3-Clause", "role": "array math", "source": "pip package numpy"},
-    {"component": "FAISS / faiss-cpu", "license": "MIT", "role": "HNSW vector index", "source": "pip package faiss-cpu"},
-    {"component": "OpenBLAS", "license": "BSD-3-Clause", "role": "BLAS backend where bundled by Linux wheels", "source": "NumPy/faiss-cpu wheel dependency path"},
-]
+VERSION = "2026.05.12-5-x3d100k"
+DEFAULT_CACHE_DIR = str(Path.home() / ".cache" / "rag_benchmark" / "cache")
+
 PERMISSIVE_LICENSES = {
     "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "0BSD", "Zlib",
-    "Unlicense", "CC0-1.0", "Public-Domain", "CC-BY-3.0", "CC-BY-4.0", "PSF-2.0",
+    "Unlicense", "Public-Domain", "CC0-1.0", "CC-BY-3.0", "CC-BY-4.0",
 }
 LICENSE_ALIASES = {
-    "apache2": "Apache-2.0", "apache-2": "Apache-2.0", "apache 2": "Apache-2.0", "apache 2.0": "Apache-2.0",
-    "bsd3": "BSD-3-Clause", "bsd-3": "BSD-3-Clause", "bsd 3": "BSD-3-Clause", "bsd-3-clause": "BSD-3-Clause",
-    "bsd2": "BSD-2-Clause", "bsd-2": "BSD-2-Clause", "bsd 2": "BSD-2-Clause", "bsd-2-clause": "BSD-2-Clause",
-    "public domain": "Public-Domain", "pd": "Public-Domain", "cc0": "CC0-1.0", "cc-by-4": "CC-BY-4.0",
+    "apache 2": "Apache-2.0", "apache-2": "Apache-2.0", "apache 2.0": "Apache-2.0",
+    "apache license 2.0": "Apache-2.0", "bsd 3 clause": "BSD-3-Clause",
+    "bsd-3": "BSD-3-Clause", "bsd 2 clause": "BSD-2-Clause", "public domain": "Public-Domain",
+    "cc0": "CC0-1.0", "cc by 4": "CC-BY-4.0", "cc-by-4": "CC-BY-4.0",
 }
 
-
-def parse_args(argv: Sequence[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Run a RAG benchmark against an OpenAI-compatible /v1/chat/completions endpoint.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    p.add_argument("endpoint_pos", nargs="?", help="Endpoint URL, with or without /v1.")
-    p.add_argument("--endpoint", help="Endpoint URL, with or without /v1.")
-    p.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY", "EMPTY"), help="Bearer token sent to the endpoint.")
-    p.add_argument("--model", default=None, help="Model id. If omitted, tries GET /v1/models and uses the first id.")
-    p.add_argument("--output", default=None, help="JSON output file path.")
-    p.add_argument("--cache-dir", default=str(Path.home() / ".cache" / "rag_benchmark" / "cache"), help="Cache directory for embeddings.")
-
-    p.add_argument("--corpus", choices=["synthetic", "local-jsonl"], default="synthetic", help="Corpus source. Default avoids third-party database text.")
-    p.add_argument("--corpus-file", default=None, help="JSONL file for --corpus local-jsonl. Each line should contain a text field.")
-    p.add_argument("--corpus-license", default=None, help="SPDX license for local-jsonl corpus. Must be permissive.")
-    p.add_argument("--jsonl-text-key", default="text", help="Text field name for local-jsonl corpus.")
-    p.add_argument("--refresh-embeddings", action="store_true", help="Ignore cached local embeddings and rebuild them.")
-    p.add_argument("--embedding-dim", type=int, default=384, help="Dimension for the built-in hashing-vectorizer embeddings.")
-
-    p.add_argument("--db-sizes", default="100000,200000", help="Comma-separated vector database sizes.")
-    p.add_argument("--batch-queries", type=int, default=3000, help="Queries per vector-search run.")
-    p.add_argument("--runs", type=int, default=10, help="Runs for vector search and index build.")
-    p.add_argument("--trim", type=float, default=0.05, help="Fraction trimmed from each side when averaging repeated runs.")
-    p.add_argument("--top-k", type=int, default=10, help="Retrieved passages per RAG request.")
-    p.add_argument("--hnsw-m", type=int, default=32, help="FAISS HNSW M parameter.")
-    p.add_argument("--hnsw-ef", type=int, default=64, help="HNSW efSearch parameter.")
-    p.add_argument("--hnsw-ef-construction", type=int, default=200, help="HNSW efConstruction parameter.")
-    p.add_argument("--index-backend", choices=["auto", "faiss", "numpy"], default="auto", help="Vector index backend. Use faiss for full HNSW results.")
-    p.add_argument("--threads", type=int, default=0, help="FAISS OMP threads. Default uses cpu_count.")
-
-    p.add_argument("--rag-workers", type=int, default=0, help="Concurrent RAG workers. Default min(cpu_count, 8).")
-    p.add_argument("--rag-runs", type=int, default=5, help="Concurrent RAG repeated runs.")
-    p.add_argument("--rag-queries-per-worker", type=int, default=20, help="RAG requests per worker per run.")
-    p.add_argument("--rag-db-size", type=int, default=10000, help="Per-worker RAG index size.")
-    p.add_argument("--context-chars", type=int, default=1200, help="Maximum context characters placed in each prompt.")
-    p.add_argument("--max-tokens", type=int, default=80, help="Max generation tokens for chat completions.")
-    p.add_argument("--temperature", type=float, default=0.0, help="Chat completion temperature.")
-    p.add_argument("--request-timeout", type=float, default=120.0, help="Per-request timeout seconds.")
-    p.add_argument("--connect-timeout", type=float, default=10.0, help="HTTP connect/probe timeout seconds.")
-    p.add_argument("--cooldown", type=float, default=2.0, help="Sleep between repeated benchmark runs.")
-    p.add_argument("--no-stream", action="store_true", help="Use non-streaming chat completions. TTFT becomes total latency.")
-    p.add_argument("--disable-nonstream-fallback", action="store_true", help="Fail if streaming fails instead of retrying non-streaming.")
-    p.add_argument("--fail-on-endpoint-error", action="store_true", help="Abort on any RAG request failure.")
-
-    p.add_argument("--skip-search", action="store_true", help="Skip batch vector-search benchmark.")
-    p.add_argument("--skip-build", action="store_true", help="Skip HNSW index-build benchmark.")
-    p.add_argument("--skip-rag", action="store_true", help="Skip concurrent RAG benchmark.")
-    p.add_argument("--quick", action="store_true", help="Use smaller sizes and fewer runs for a smoke benchmark.")
-    p.add_argument("--self-test", action="store_true", help="Run a tiny benchmark against a local mock endpoint.")
-    p.add_argument("--license-audit", action="store_true", help="Print license posture and exit.")
-    p.add_argument("--plain", action="store_true", help="Disable ANSI styling/live updates.")
-    args = p.parse_args(argv)
-    return args
-
-
-class UI:
-    def __init__(self, plain: bool = False) -> None:
-        self.plain = plain or not sys.stdout.isatty()
-        self.last_progress_len = 0
-
-    def c(self, code: str, s: str) -> str:
-        return s if self.plain else f"\033[{code}m{s}\033[0m"
-
-    def bold(self, s: str) -> str:
-        return self.c("1", s)
-
-    def dim(self, s: str) -> str:
-        return self.c("2", s)
-
-    def green(self, s: str) -> str:
-        return self.c("32", s)
-
-    def yellow(self, s: str) -> str:
-        return self.c("33", s)
-
-    def red(self, s: str) -> str:
-        return self.c("31", s)
-
-    def cyan(self, s: str) -> str:
-        return self.c("36", s)
-
-    def blue(self, s: str) -> str:
-        return self.c("34", s)
-
-    def print(self, s: str = "") -> None:
-        print(s, flush=True)
-
-    def rule(self, title: str = "") -> None:
-        width = 88
-        if title:
-            label = f" {title} "
-            left = max(0, (width - len(label)) // 2)
-            right = max(0, width - len(label) - left)
-            self.print(self.cyan("=" * left + label + "=" * right))
-        else:
-            self.print(self.cyan("=" * width))
-
-    def box(self, title: str, lines: Sequence[str]) -> None:
-        width = 88
-        self.print(self.cyan("+" + "=" * (width - 2) + "+"))
-        t = f" {title} "
-        pad = max(0, width - 2 - len(t))
-        self.print(self.cyan("|") + self.bold(t + " " * pad) + self.cyan("|"))
-        self.print(self.cyan("+" + "-" * (width - 2) + "+"))
-        for line in lines:
-            raw = strip_ansi(line)
-            if len(raw) > width - 4:
-                line = raw[: width - 7] + "..."
-                raw = line
-            self.print(self.cyan("|") + " " + line + " " * max(0, width - 3 - len(raw)) + self.cyan("|"))
-        self.print(self.cyan("+" + "=" * (width - 2) + "+"))
-
-    def table(self, title: str, headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> None:
-        self.rule(title)
-        text_rows = [[str(x) for x in row] for row in rows]
-        widths = [len(str(h)) for h in headers]
-        for row in text_rows:
-            for i, cell in enumerate(row):
-                widths[i] = max(widths[i], len(strip_ansi(cell)))
-        fmt = "  ".join("{:<" + str(w) + "}" for w in widths)
-        self.print(self.bold(fmt.format(*headers)))
-        self.print("  ".join("-" * w for w in widths))
-        for row in text_rows:
-            padded = []
-            for i, cell in enumerate(row):
-                padded.append(cell + " " * max(0, widths[i] - len(strip_ansi(cell))))
-            self.print("  ".join(padded))
-        self.print()
-
-    def progress(self, label: str, current: int, total: int) -> None:
-        if self.plain:
-            if current == total or current == 1 or current % max(1, total // 10) == 0:
-                self.print(f"{label}: {current}/{total}")
-            return
-        width = 28
-        frac = current / total if total else 1.0
-        filled = min(width, int(width * frac))
-        bar = "#" * filled + "." * (width - filled)
-        msg = f"\r\033[K{label} [{bar}] {current}/{total} {frac*100:5.1f}%"
-        print(self.c("36", msg), end="", flush=True)
-        if current >= total:
-            print(flush=True)
-
-    def status(self, msg: str) -> None:
-        if self.plain:
-            self.print(msg)
-        else:
-            print(self.c("36", "\r\033[K" + msg), end="", flush=True)
-
-    def end_status(self) -> None:
-        if not self.plain:
-            print("\r\033[K", end="", flush=True)
-
-
-def strip_ansi(s: str) -> str:
-    return re.sub(r"\x1b\[[0-9;]*m", "", str(s))
-
-
-def now_utc_iso() -> str:
-    return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat()
-
-
-def parse_db_sizes(raw: str) -> List[int]:
-    sizes: List[int] = []
-    for part in raw.split(","):
-        part = part.strip().replace("_", "")
-        if not part:
-            continue
-        value = int(part)
-        if value <= 0:
-            raise ValueError("db sizes must be positive")
-        sizes.append(value)
-    if not sizes:
-        raise ValueError("no db sizes provided")
-    return sorted(set(sizes))
-
-
-def apply_quick_defaults(args: argparse.Namespace) -> None:
-    if not args.quick:
-        return
-    args.db_sizes = "10000"
-    args.batch_queries = min(args.batch_queries, 300)
-    args.runs = min(args.runs, 3)
-    args.rag_runs = min(args.rag_runs, 2)
-    args.rag_queries_per_worker = min(args.rag_queries_per_worker, 5)
-    if args.rag_workers == 0:
-        args.rag_workers = 2
-    else:
-        args.rag_workers = min(args.rag_workers, 2)
-    args.rag_db_size = min(args.rag_db_size, 5000)
-    args.cooldown = min(args.cooldown, 0.5)
-    args.context_chars = min(args.context_chars, 800)
-
-
-def normalize_endpoint(url: str) -> str:
-    url = (url or "").strip()
-    if not url:
-        raise ValueError("empty endpoint URL")
-    if "://" not in url:
-        url = "http://" + url
-    parts = urlsplit(url)
-    if not parts.netloc:
-        raise ValueError(f"invalid endpoint URL: {url}")
-    path = parts.path.rstrip("/")
-    if re.search(r"(^|/)v1$", path):
-        new_path = path
-    elif "/v1/" in path + "/":
-        new_path = path[: path.index("/v1") + 3]
-    else:
-        new_path = path + "/v1"
-    return urlunsplit((parts.scheme, parts.netloc, new_path, "", ""))
-
-
-def chat_url(base: str) -> str:
-    return base.rstrip("/") + "/chat/completions"
-
-
-def models_url(base: str) -> str:
-    return base.rstrip("/") + "/models"
+TOPICS = [
+    "computer architecture cache behavior", "retrieval augmented generation", "graph nearest neighbor search",
+    "renewable energy storage", "urban water logistics", "marine coral ecology",
+    "railway signaling systems", "astronomy orbital mechanics", "public health routing",
+    "distributed database indexing", "compiler optimization notes", "volcanic island geology",
+    "language documentation projects", "supply chain scheduling", "sensor network calibration",
+    "medieval trade routes", "agricultural soil monitoring", "robotics motion planning",
+    "privacy preserving analytics", "data center cooling", "satellite image cataloging",
+    "financial anomaly detection", "medical triage simulation", "geospatial disaster response",
+    "education curriculum mapping", "acoustic wildlife monitoring", "battery materials testing",
+    "weather station quality control", "library archive restoration", "manufacturing defect analysis",
+    "legal document retrieval", "protein folding summaries",
+]
 
 
 def import_numpy():
     try:
         import numpy as np  # type: ignore
     except Exception as exc:
-        raise SystemExit("Missing numpy. Re-run without --no-install, or install: pip install numpy") from exc
+        raise SystemExit("NumPy is required. Re-run without --no-install, or install numpy.") from exc
     return np
 
 
-def faiss_available() -> bool:
+def import_faiss(required: bool):
     try:
-        import faiss  # noqa: F401
-        return True
-    except Exception:
-        return False
+        import faiss  # type: ignore
+        return faiss
+    except Exception as exc:
+        if required:
+            raise SystemExit("FAISS is required for X3D-comparable HNSW runs. Re-run without --no-install, or install faiss-cpu, or use --index-backend numpy for a smoke-only fallback.") from exc
+        return None
 
 
-def choose_backend(requested: str) -> str:
-    if requested == "numpy":
-        return "numpy"
-    if requested == "faiss":
-        if not faiss_available():
-            raise SystemExit("FAISS is required for --index-backend faiss. Install with: pip install faiss-cpu")
-        return "faiss"
-    return "faiss" if faiss_available() else "numpy"
+class UI:
+    def __init__(self, plain: bool = False):
+        self.plain = plain or (not sys.stdout.isatty())
+        self.last_len = 0
+
+    def c(self, code: str) -> str:
+        return "" if self.plain else f"\033[{code}m"
+
+    def bold(self, s: str) -> str:
+        return self.c("1") + s + self.c("0")
+
+    def dim(self, s: str) -> str:
+        return self.c("2") + s + self.c("0")
+
+    def cyan(self, s: str) -> str:
+        return self.c("36") + s + self.c("0")
+
+    def green(self, s: str) -> str:
+        return self.c("32") + s + self.c("0")
+
+    def yellow(self, s: str) -> str:
+        return self.c("33") + s + self.c("0")
+
+    def red(self, s: str) -> str:
+        return self.c("31") + s + self.c("0")
+
+    def blue(self, s: str) -> str:
+        return self.c("34") + s + self.c("0")
+
+    def print(self, msg: str = "") -> None:
+        if self.last_len:
+            sys.stdout.write("\n")
+            self.last_len = 0
+        print(msg, flush=True)
+
+    def rule(self, title: str) -> None:
+        self.print("\n" + self.bold(self.cyan(title)))
+        self.print("-" * min(96, max(30, len(title) + 8)))
+
+    def progress(self, label: str, current: int, total: int) -> None:
+        if self.plain:
+            if current == total or current == 1 or current % max(1, total // 10) == 0:
+                self.print(f"{label}: {current}/{total}")
+            return
+        width = 34
+        frac = 0.0 if total <= 0 else min(1.0, current / total)
+        filled = int(width * frac)
+        bar = "█" * filled + "░" * (width - filled)
+        line = f"\r{self.cyan(label)} [{bar}] {current:,}/{total:,}"
+        sys.stdout.write(line + " " * max(0, self.last_len - len(line)))
+        sys.stdout.flush()
+        self.last_len = len(line)
+        if current >= total:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self.last_len = 0
+
+    def table(self, title: str, headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> None:
+        self.rule(title)
+        data = [[str(c) for c in row] for row in rows]
+        widths = [len(str(h)) for h in headers]
+        for row in data:
+            for i, cell in enumerate(row):
+                widths[i] = max(widths[i], len(cell))
+        fmt = "  " + "  ".join("{:<" + str(w) + "}" for w in widths)
+        self.print(fmt.format(*headers))
+        self.print("  " + "  ".join("-" * w for w in widths))
+        for row in data:
+            self.print(fmt.format(*row))
+
+    def box(self, title: str, lines: Sequence[str]) -> None:
+        content = [title] + list(lines)
+        width = max(50, min(110, max(len(strip_ansi(x)) for x in content) + 4))
+        tl, tr, bl, br, h, v = ("+", "+", "+", "+", "-", "|") if self.plain else ("╭", "╮", "╰", "╯", "─", "│")
+        self.print(tl + h * (width - 2) + tr)
+        self.print(v + " " + self.bold(title).ljust(width - 3 + len(self.bold(title)) - len(title)) + v)
+        self.print(v + " " * (width - 2) + v)
+        for line in lines:
+            pad = width - 3 - len(strip_ansi(line))
+            self.print(v + " " + line + " " * max(0, pad) + v)
+        self.print(bl + h * (width - 2) + br)
+
+    def bar_chart(self, title: str, rows: Sequence[Tuple[str, float, str]], unit: str, subtitle: str = "", lower_is_better: bool = False) -> None:
+        self.rule(title)
+        if subtitle:
+            self.print(self.dim(subtitle))
+        if not rows:
+            self.print("No data")
+            return
+        max_value = max(abs(v) for _, v, _ in rows) or 1.0
+        label_w = min(28, max(len(label) for label, _, _ in rows))
+        bar_w = 48
+        for label, value, color in rows:
+            frac = min(1.0, abs(value) / max_value)
+            filled = max(1, int(bar_w * frac)) if value > 0 else 0
+            bar_char = "#" if self.plain else "█"
+            bar = bar_char * filled
+            if not self.plain:
+                color_code = {"green": "32", "blue": "34", "red": "31", "yellow": "33", "cyan": "36"}.get(color, "37")
+                bar = self.c(color_code) + bar + self.c("0")
+            val = format_value(value, unit)
+            arrow = " lower is better" if lower_is_better else ""
+            self.print(f"  {label:<{label_w}}  {bar:<{bar_w}}  {val}{arrow}")
 
 
-def cmd_output(cmd: List[str], timeout: float = 5.0) -> str:
-    try:
-        return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True, timeout=timeout).strip()
-    except Exception:
-        return ""
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+def strip_ansi(s: str) -> str:
+    return ANSI_RE.sub("", s)
 
 
-def is_wsl() -> bool:
-    texts = [platform.release(), platform.version()]
-    try:
-        texts.append(Path("/proc/version").read_text(errors="ignore"))
-    except Exception:
-        pass
-    blob = " ".join(texts).lower()
-    return "microsoft" in blob or "wsl" in blob
-
-
-def cpu_model() -> str:
-    if Path("/proc/cpuinfo").exists():
-        try:
-            for line in Path("/proc/cpuinfo").read_text(errors="ignore").splitlines():
-                if line.lower().startswith("model name"):
-                    return line.split(":", 1)[1].strip()
-        except Exception:
-            pass
-    out = cmd_output(["lscpu"])
-    for line in out.splitlines():
-        if line.startswith("Model name:"):
-            return line.split(":", 1)[1].strip()
-    return platform.processor() or "unknown"
-
-
-def memory_gb() -> float:
-    try:
-        for line in Path("/proc/meminfo").read_text(errors="ignore").splitlines():
-            if line.startswith("MemTotal:"):
-                kb = float(line.split()[1])
-                return round(kb / 1024.0 / 1024.0, 2)
-    except Exception:
-        pass
-    return 0.0
-
-
-def l3_cache() -> str:
-    out = cmd_output(["lscpu"])
-    for line in out.splitlines():
-        if "L3 cache" in line:
-            return line.split(":", 1)[1].strip()
-    return "unknown"
-
-
-def system_info() -> Dict[str, Any]:
-    return {
-        "utc_time": now_utc_iso(),
-        "platform": platform.platform(),
-        "python": sys.version.split()[0],
-        "cpu_model": cpu_model(),
-        "cpu_count": os.cpu_count() or 1,
-        "memory_gb": memory_gb(),
-        "l3_cache": l3_cache(),
-        "is_wsl": is_wsl(),
-    }
-
-
-def trimmed(values: Sequence[float], trim: float) -> List[float]:
-    if not values:
-        return []
-    arr = sorted(float(v) for v in values)
-    cut = int(len(arr) * trim)
-    if cut > 0 and len(arr) > 2 * cut:
-        return arr[cut:-cut]
-    return arr
-
-
-def mean(values: Sequence[float]) -> float:
-    return float(sum(values) / len(values)) if values else 0.0
-
-
-def stddev(values: Sequence[float]) -> float:
-    if not values:
-        return 0.0
-    m = mean(values)
-    return math.sqrt(sum((float(v) - m) ** 2 for v in values) / len(values))
+def format_value(value: float, unit: str) -> str:
+    if unit == "qps":
+        return f"{value:,.0f} QPS"
+    if unit == "req/s":
+        return f"{value:,.2f} req/s"
+    if unit == "s":
+        return f"{value:,.2f} s"
+    if unit == "vec/s":
+        return f"{value:,.0f} vec/s"
+    if unit == "ms":
+        return f"{value:,.1f} ms"
+    return f"{value:,.3f} {unit}"
 
 
 def percentile(values: Sequence[float], p: float) -> float:
     if not values:
         return 0.0
-    arr = sorted(float(v) for v in values)
-    if len(arr) == 1:
-        return arr[0]
-    pos = (len(arr) - 1) * (p / 100.0)
-    lo = int(math.floor(pos))
-    hi = int(math.ceil(pos))
-    if lo == hi:
-        return arr[lo]
-    return arr[lo] * (hi - pos) + arr[hi] * (pos - lo)
+    np = import_numpy()
+    return float(np.percentile(np.array(values, dtype=np.float64), p, method="linear"))
 
 
-def summarize_seconds(values: Sequence[float], trim: float = 0.0) -> Dict[str, float]:
+def trimmed(values: Sequence[float], trim: float) -> List[float]:
+    vals = sorted(float(v) for v in values)
+    if not vals:
+        return []
+    cut = int(len(vals) * trim)
+    if cut > 0 and len(vals) > 2 * cut:
+        return vals[cut:-cut]
+    return vals
+
+
+def mean(values: Sequence[float]) -> float:
     vals = list(values)
-    tv = trimmed(vals, trim)
-    avg = mean(tv)
+    return float(sum(vals) / len(vals)) if vals else 0.0
+
+
+def stddev(values: Sequence[float]) -> float:
+    vals = list(values)
+    if len(vals) < 2:
+        return 0.0
+    m = mean(vals)
+    return math.sqrt(sum((x - m) ** 2 for x in vals) / len(vals))
+
+
+def summarize_rates(values: Sequence[float], trim: float) -> Dict[str, Any]:
+    tv = trimmed(values, trim)
+    m = mean(tv)
     sd = stddev(tv)
+    return {
+        "mean": round(m, 6),
+        "stddev": round(sd, 6),
+        "cv_percent": round((sd / m * 100.0) if m > 0 else 0.0, 4),
+        "runs": [round(float(v), 6) for v in values],
+    }
+
+
+def summarize_seconds(values: Sequence[float], trim: float) -> Dict[str, Any]:
+    tv = trimmed(values, trim)
+    m = mean(tv)
+    sd = stddev(tv)
+    return {
+        "mean_s": round(m, 6),
+        "stddev_s": round(sd, 6),
+        "cv_percent": round((sd / m * 100.0) if m > 0 else 0.0, 4),
+        "p50_s": round(percentile(values, 50), 6),
+        "p95_s": round(percentile(values, 95), 6),
+        "p99_s": round(percentile(values, 99), 6),
+        "runs_s": [round(float(v), 6) for v in values],
+    }
+
+
+def latency_summary(values: Sequence[float]) -> Dict[str, Any]:
+    vals = list(values)
     return {
         "count": len(vals),
-        "mean_ms": round(avg * 1000.0, 3),
-        "stddev_ms": round(sd * 1000.0, 3),
-        "p50_ms": round(percentile(vals, 50) * 1000.0, 3),
-        "p95_ms": round(percentile(vals, 95) * 1000.0, 3),
-        "p99_ms": round(percentile(vals, 99) * 1000.0, 3),
+        "mean_ms": round(mean(vals) * 1000.0, 4),
+        "p50_ms": round(percentile(vals, 50) * 1000.0, 4),
+        "p95_ms": round(percentile(vals, 95) * 1000.0, 4),
+        "p99_ms": round(percentile(vals, 99) * 1000.0, 4),
     }
 
 
-def summarize_rate(values: Sequence[float], trim: float) -> Dict[str, Any]:
-    vals = list(values)
-    tv = trimmed(vals, trim)
-    avg = mean(tv)
-    sd = stddev(tv)
-    cv = (sd / avg * 100.0) if avg > 0 else 0.0
-    return {
-        "mean": round(avg, 3),
-        "stddev": round(sd, 3),
-        "cv_percent": round(cv, 3),
-        "runs": [round(v, 3) for v in vals],
-    }
-
-
-def sparkline(values: Sequence[float]) -> str:
-    vals = list(values)
-    if not vals:
-        return ""
-    chars = " .:-=+*#%@"
-    lo, hi = min(vals), max(vals)
-    if hi <= lo:
-        return chars[-1] * len(vals)
+def parse_db_sizes(raw: str) -> List[int]:
     out = []
-    for v in vals:
-        idx = int((v - lo) / (hi - lo) * (len(chars) - 1))
-        out.append(chars[idx])
-    return "".join(out)
-
-
-def fmt_num(x: Any, decimals: int = 2) -> str:
-    try:
-        f = float(x)
-    except Exception:
-        return str(x)
-    if abs(f) >= 1000:
-        return f"{f:,.{decimals}f}"
-    return f"{f:.{decimals}f}"
-
-
-def fmt_ms(ms: Any) -> str:
-    try:
-        return f"{float(ms):,.1f} ms"
-    except Exception:
-        return str(ms)
-
-
-def clean_text(s: str, limit: int = 900) -> str:
-    s = re.sub(r"\s+", " ", s or "").strip()
-    if len(s) > limit:
-        s = s[:limit].rsplit(" ", 1)[0]
-    return s
+    for part in str(raw).split(','):
+        part = part.strip().replace('_', '')
+        if not part:
+            continue
+        n = int(part)
+        if n <= 0:
+            raise SystemExit("DB sizes must be positive")
+        out.append(n)
+    return out or [100000]
 
 
 def canonical_license(label: Optional[str]) -> str:
@@ -1187,49 +660,86 @@ def canonical_license(label: Optional[str]) -> str:
     return LICENSE_ALIASES.get(key, raw)
 
 
-def require_permissive_license(label: Optional[str]) -> str:
+def require_permissive(label: Optional[str]) -> str:
     canon = canonical_license(label)
     if canon not in PERMISSIVE_LICENSES:
-        allowed = ", ".join(sorted(PERMISSIVE_LICENSES))
-        raise SystemExit(
-            f"Local corpus license '{label or '<missing>'}' is not accepted by this benchmark. "
-            f"Use a permissive corpus license and pass --corpus-license. Accepted: {allowed}"
-        )
+        raise SystemExit(f"Local corpus license '{label or '<missing>'}' is not on the permissive allow-list: {', '.join(sorted(PERMISSIVE_LICENSES))}")
     return canon
 
 
-def synthetic_db_texts(total: int) -> List[str]:
-    topics = [
-        "astronomy orbital mechanics", "urban water systems", "medieval trade routes",
-        "machine learning evaluation", "renewable energy storage", "marine coral ecology",
-        "ancient agriculture", "computer architecture caches", "public health logistics",
-        "railway signaling systems", "language documentation", "volcanic island geology",
-    ]
-    regions = ["north", "south", "east", "west", "central"]
-    methods = ["survey", "simulation", "field report", "archive review", "sensor log", "case study"]
-    docs: List[str] = []
-    for i in range(total):
-        topic = topics[i % len(topics)]
-        region = regions[(i // len(topics)) % len(regions)]
-        method = methods[i % len(methods)]
-        fact = f"RBFACT{i:07d}"
-        metric = 17 + ((i * 37) % 83)
-        doc = (
-            f"Passage {i}. Topic: {topic}. Retrieval key {fact}. "
-            f"The {region} {method} records measurement {metric} and describes causes, constraints, "
-            f"tradeoffs, and practical outcomes. This synthetic passage is generated locally for RAG "
-            f"benchmarking and contains no third-party source text."
-        )
-        docs.append(doc)
-    return docs
+def system_info() -> Dict[str, Any]:
+    cpu = platform.processor() or "Unknown CPU"
+    try:
+        if Path("/proc/cpuinfo").exists():
+            for line in Path("/proc/cpuinfo").read_text(errors="ignore").splitlines():
+                if line.lower().startswith("model name"):
+                    cpu = line.split(":", 1)[1].strip()
+                    break
+    except Exception:
+        pass
+    l3 = "Unknown"
+    try:
+        out = subprocess.check_output(["lscpu"], text=True, stderr=subprocess.DEVNULL, timeout=3)
+        for line in out.splitlines():
+            if "L3 cache" in line:
+                l3 = line.split(":", 1)[1].strip()
+                break
+    except Exception:
+        pass
+    mem_gb = 0.0
+    try:
+        for line in Path("/proc/meminfo").read_text(errors="ignore").splitlines():
+            if line.startswith("MemTotal"):
+                mem_gb = round(int(line.split()[1]) / 1024 / 1024, 2)
+                break
+    except Exception:
+        pass
+    is_wsl = False
+    try:
+        txt = Path("/proc/version").read_text(errors="ignore").lower()
+        is_wsl = "microsoft" in txt or "wsl" in txt
+    except Exception:
+        pass
+    gpu = "N/A"
+    try:
+        gpu = subprocess.check_output(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], text=True, stderr=subprocess.DEVNULL, timeout=3).strip() or "N/A"
+    except Exception:
+        pass
+    return {
+        "cpu": cpu,
+        "cpu_count": os.cpu_count() or 1,
+        "l3_cache": l3,
+        "memory_gb": mem_gb,
+        "gpu": gpu,
+        "platform": platform.platform(),
+        "python": sys.version.split()[0],
+        "is_wsl": is_wsl,
+        "hostname": socket.gethostname(),
+    }
 
 
-def query_for_doc(doc: str, doc_id: int, qid: int) -> str:
-    topic_match = re.search(r"Topic: ([^.]+)", doc)
-    fact_match = re.search(r"RBFACT\d+", doc)
-    topic = topic_match.group(1) if topic_match else clean_text(doc, 80)
-    fact = fact_match.group(0) if fact_match else f"document {doc_id}"
-    return f"For retrieval query {qid}, summarize the passage about {topic} with key {fact}."
+def doc_cluster(doc_id: int, clusters: int, seed: int) -> int:
+    return int(((doc_id * 2654435761 + seed * 1013904223) & 0xFFFFFFFF) % clusters)
+
+
+def doc_text(doc_id: int, clusters: int, seed: int) -> str:
+    cl = doc_cluster(doc_id, clusters, seed)
+    topic = TOPICS[cl % len(TOPICS)]
+    region = ["north", "south", "east", "west", "central"][doc_id % 5]
+    method = ["survey", "simulation", "field report", "archive review", "sensor log", "case study"][doc_id % 6]
+    metric = 17 + ((doc_id * 37) % 83)
+    return (
+        f"Passage {doc_id:07d}. Retrieval key RB{doc_id:07d}. Topic: {topic}. "
+        f"The {region} {method} records measurement {metric} and notes causes, constraints, "
+        f"tradeoffs, and practical outcomes. This synthetic benchmark passage is generated locally "
+        f"and contains no third-party source text."
+    )
+
+
+def question_for_doc(doc_id: int, qid: int, clusters: int, seed: int) -> str:
+    cl = doc_cluster(doc_id, clusters, seed)
+    topic = TOPICS[cl % len(TOPICS)]
+    return f"For query {qid:06d}, answer briefly using the context for retrieval key RB{doc_id:07d} about {topic}."
 
 
 def load_local_jsonl(path: str, text_key: str) -> List[str]:
@@ -1243,304 +753,328 @@ def load_local_jsonl(path: str, text_key: str) -> List[str]:
             if not line:
                 continue
             try:
-                row = json.loads(line)
+                obj = json.loads(line)
             except json.JSONDecodeError as exc:
-                raise SystemExit(f"Invalid JSONL at line {line_no}: {exc}") from exc
-            if isinstance(row, dict):
-                text = row.get(text_key)
-                if text is None:
-                    for value in row.values():
-                        if isinstance(value, str) and len(value.strip()) >= 20:
-                            text = value
+                raise SystemExit(f"Invalid JSONL line {line_no}: {exc}") from exc
+            txt = None
+            if isinstance(obj, dict):
+                txt = obj.get(text_key)
+                if txt is None:
+                    for v in obj.values():
+                        if isinstance(v, str) and len(v.strip()) >= 20:
+                            txt = v
                             break
-            elif isinstance(row, str):
-                text = row
-            else:
-                text = None
-            text = clean_text(str(text or ""))
-            if len(text) >= 40:
-                texts.append(text)
+            elif isinstance(obj, str):
+                txt = obj
+            if txt:
+                cleaned = re.sub(r"\s+", " ", str(txt)).strip()
+                if len(cleaned) >= 40:
+                    texts.append(cleaned[:1200])
     if not texts:
-        raise SystemExit(f"No usable text rows found in {p}")
+        raise SystemExit(f"No usable text found in {p}")
     return texts
 
 
-def load_corpus(args: argparse.Namespace, max_db: int, q_count: int, ui: UI) -> Tuple[List[str], List[str], List[int], Dict[str, Any]]:
-    if args.corpus == "synthetic":
-        db_texts = synthetic_db_texts(max_db)
-        license_label = "MIT synthetic fixture / no third-party source text"
-        source = "synthetic-generated-local"
-        corpus_file = None
-    else:
-        license_label = require_permissive_license(args.corpus_license)
-        if not args.corpus_file:
-            raise SystemExit("--corpus-file is required when --corpus local-jsonl")
-        source = "local-jsonl"
-        corpus_file = str(Path(args.corpus_file).expanduser())
-        ui.print(f"Loading local JSONL corpus: {corpus_file}")
-        db_texts = load_local_jsonl(corpus_file, args.jsonl_text_key)
-        if len(db_texts) < max_db:
-            repeats = (max_db // max(1, len(db_texts))) + 1
-            db_texts = (db_texts * repeats)[:max_db]
-        else:
-            db_texts = db_texts[:max_db]
-
-    query_doc_ids = [((i * 9973) % max_db) for i in range(q_count)]
-    q_texts = [query_for_doc(db_texts[doc_id], doc_id, i) for i, doc_id in enumerate(query_doc_ids)]
-    info = {
-        "source": source,
-        "license": license_label,
-        "count_db": len(db_texts),
-        "count_query": len(q_texts),
-        "corpus_file": corpus_file,
-        "jsonl_text_key": args.jsonl_text_key if args.corpus == "local-jsonl" else None,
-        "notes": "Default corpus is generated locally and does not include third-party database text.",
-    }
-    return db_texts, q_texts, query_doc_ids, info
-
-
-TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
-
-
-def token_hash(token: str, dim: int) -> Tuple[int, float]:
-    digest = hashlib.blake2b(token.encode("utf-8", errors="ignore"), digest_size=8).digest()
-    value = int.from_bytes(digest, "little", signed=False)
-    return value % dim, 1.0 if ((value >> 63) & 1) == 0 else -1.0
-
-
-def hashed_lexical_embeddings(texts: Sequence[str], dim: int, ui: UI, label: str):
+def normalize_rows(arr: Any) -> Any:
     np = import_numpy()
-    arr = np.zeros((len(texts), dim), dtype=np.float32)
-    cache: Dict[str, Tuple[int, float]] = {}
-    total = len(texts)
-    update_every = max(1, total // 100)
-    for i, text in enumerate(texts):
-        tokens = TOKEN_RE.findall(text.lower())
-        # Unigrams with extra weight for synthetic retrieval keys.
-        for tok in tokens:
-            item = cache.get(tok)
-            if item is None:
-                item = token_hash(tok, dim)
-                cache[tok] = item
-            idx, sign = item
-            weight = 3.0 if tok.startswith("rbfact") else 1.0
-            arr[i, idx] += sign * weight
-        # A few adjacent-token features improve lexical retrieval without external models.
-        for a, b in zip(tokens[:80], tokens[1:81]):
-            if len(a) < 3 or len(b) < 3:
-                continue
-            tok = "bi:" + a + "_" + b
-            item = cache.get(tok)
-            if item is None:
-                item = token_hash(tok, dim)
-                cache[tok] = item
-            idx, sign = item
-            arr[i, idx] += sign * 0.5
-        norm = float(np.linalg.norm(arr[i]))
-        if norm > 0:
-            arr[i] /= norm
-        if (i + 1) % update_every == 0 or i + 1 == total:
-            ui.progress(f"Embedding {label}", i + 1, total)
-    return arr
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return (arr / norms).astype(np.float32, copy=False)
 
 
-def hash_texts_for_cache(texts: Sequence[str]) -> str:
-    h = hashlib.sha256()
-    for text in texts:
-        h.update(text.encode("utf-8", errors="ignore"))
-        h.update(b"\0")
-    return h.hexdigest()
-
-
-def embedding_cache_key(args: argparse.Namespace, db_texts: Sequence[str], q_texts: Sequence[str], corpus_info: Dict[str, Any]) -> str:
-    payload = {
-        "version": 3,
-        "embedding": "built-in-hashing-vectorizer",
+def workload_dict(args: argparse.Namespace, db_sizes: Sequence[int], q_count: int, endpoint_model: Optional[str] = None) -> Dict[str, Any]:
+    workers = args.rag_workers or min(os.cpu_count() or 1, 8)
+    return {
+        "benchmark_version": VERSION,
+        "profile": args.profile,
+        "db_sizes": list(map(int, db_sizes)),
+        "batch_queries": args.batch_queries,
+        "runs": args.runs,
+        "warmup_batches": args.warmup_batches,
+        "build_runs": args.build_runs,
+        "top_k": args.top_k,
+        "hnsw_m": args.hnsw_m,
+        "hnsw_ef": args.hnsw_ef,
+        "hnsw_ef_construction": args.hnsw_ef_construction,
         "embedding_dim": args.embedding_dim,
-        "corpus_source": corpus_info.get("source"),
-        "corpus_license": corpus_info.get("license"),
-        "db_count": len(db_texts),
-        "q_count": len(q_texts),
-        "text_hash": hash_texts_for_cache(list(db_texts) + list(q_texts)),
+        "cluster_count": args.cluster_count,
+        "seed": args.seed,
+        "query_seed": args.query_seed,
+        "q_count": q_count,
+        "corpus": args.corpus,
+        "rag_workers": workers,
+        "rag_runs": args.rag_runs,
+        "rag_queries_per_worker": args.rag_queries_per_worker,
+        "rag_db_size": args.rag_db_size,
+        "max_tokens": args.max_tokens,
+        "temperature": args.temperature,
+        "context_chars": args.context_chars,
+        "send_seed": args.send_seed,
+        "request_seed": args.request_seed,
+        "endpoint_model": endpoint_model or args.model or "<auto>",
     }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:20]
 
 
-def load_or_build_embeddings(args: argparse.Namespace, db_texts: List[str], q_texts: List[str], corpus_info: Dict[str, Any], ui: UI):
+def stable_hash(payload: Any, n: int = 16) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:n]
+
+
+def generate_synthetic_embeddings(args: argparse.Namespace, max_db: int, q_count: int, ui: UI) -> Tuple[Any, Any, Any, Dict[str, Any]]:
     np = import_numpy()
     cache_dir = Path(args.cache_dir).expanduser()
     cache_dir.mkdir(parents=True, exist_ok=True)
-    key = embedding_cache_key(args, db_texts, q_texts, corpus_info)
-    db_path = cache_dir / f"db_embeddings_{key}.npy"
-    q_path = cache_dir / f"query_embeddings_{key}.npy"
-    meta_path = cache_dir / f"embedding_meta_{key}.json"
-    if not args.refresh_embeddings and db_path.exists() and q_path.exists() and meta_path.exists():
-        ui.print(f"Loading cached embeddings: {db_path.name}, {q_path.name}")
-        db = np.load(str(db_path))
-        q = np.load(str(q_path))
-        meta = json.loads(meta_path.read_text())
-        meta["loaded_from_cache"] = True
-        return db.astype(np.float32, copy=False), q.astype(np.float32, copy=False), meta
+    cache_payload = {
+        "version": 4,
+        "kind": "clustered-synthetic-dense-vectors",
+        "max_db": max_db,
+        "q_count": q_count,
+        "dim": args.embedding_dim,
+        "clusters": args.cluster_count,
+        "seed": args.seed,
+        "query_seed": args.query_seed,
+        "corpus": args.corpus,
+    }
+    key = stable_hash(cache_payload, 20)
+    db_path = cache_dir / f"x3dsynthetic_db_{key}.npy"
+    q_path = cache_dir / f"x3dsynthetic_q_{key}.npy"
+    ids_path = cache_dir / f"x3dsynthetic_qids_{key}.npy"
+    meta_path = cache_dir / f"x3dsynthetic_meta_{key}.json"
+    if not args.refresh_cache and db_path.exists() and q_path.exists() and ids_path.exists() and meta_path.exists():
+        ui.print(f"Loading deterministic embedding cache: {db_path.name}")
+        return np.load(str(db_path), mmap_mode="r"), np.load(str(q_path), mmap_mode="r"), np.load(str(ids_path), mmap_mode="r"), json.loads(meta_path.read_text())
 
-    ui.rule("Local embeddings")
-    t0 = time.perf_counter()
-    db = hashed_lexical_embeddings(db_texts, args.embedding_dim, ui, "documents")
-    q = hashed_lexical_embeddings(q_texts, args.embedding_dim, ui, "queries")
-    elapsed = time.perf_counter() - t0
+    ui.rule("Generating deterministic synthetic workload")
+    rng = np.random.default_rng(args.seed)
+    centers = rng.normal(0, 1, size=(args.cluster_count, args.embedding_dim)).astype(np.float32)
+    centers = normalize_rows(centers)
+    db = np.empty((max_db, args.embedding_dim), dtype=np.float32)
+    chunk = 4096
+    for start in range(0, max_db, chunk):
+        end = min(max_db, start + chunk)
+        ids = np.arange(start, end, dtype=np.int64)
+        cids = ((ids * 2654435761 + args.seed * 1013904223) & 0xFFFFFFFF) % args.cluster_count
+        noise = rng.normal(0, 1, size=(end - start, args.embedding_dim)).astype(np.float32)
+        block = centers[cids.astype(np.int64)] * 0.86 + noise * 0.14
+        db[start:end] = normalize_rows(block)
+        ui.progress("Synthetic DB vectors", end, max_db)
+
+    qrng = np.random.default_rng(args.query_seed)
+    qids = ((np.arange(q_count, dtype=np.int64) * 9973 + 17) % max_db).astype(np.int64)
+    qcids = ((qids * 2654435761 + args.seed * 1013904223) & 0xFFFFFFFF) % args.cluster_count
+    q = np.empty((q_count, args.embedding_dim), dtype=np.float32)
+    for start in range(0, q_count, chunk):
+        end = min(q_count, start + chunk)
+        noise = qrng.normal(0, 1, size=(end - start, args.embedding_dim)).astype(np.float32)
+        block = centers[qcids[start:end].astype(np.int64)] * 0.92 + noise * 0.08
+        q[start:end] = normalize_rows(block)
+        ui.progress("Synthetic query vectors", end, q_count)
+
     np.save(str(db_path), db)
     np.save(str(q_path), q)
+    np.save(str(ids_path), qids)
     meta = {
-        "backend": "built-in-hashing-vectorizer",
-        "license": "part of MIT benchmark script; no external embedding model",
-        "embedding_dim": args.embedding_dim,
-        "db_shape": list(db.shape),
-        "query_shape": list(q.shape),
-        "build_seconds": round(elapsed, 3),
+        "source": "synthetic-generated-local",
+        "license": "MIT synthetic fixture / no third-party source text",
         "db_path": str(db_path),
         "query_path": str(q_path),
-        "loaded_from_cache": False,
+        "query_doc_ids_path": str(ids_path),
+        "cache_key": key,
+        "cache_payload": cache_payload,
+        "notes": "Dense clustered vectors are generated deterministically from fixed seeds; no third-party text or embeddings are downloaded.",
     }
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    ui.print(f"Saved embedding cache: {db_path.name}, {q_path.name}")
-    return db, q, meta
+    return np.load(str(db_path), mmap_mode="r"), np.load(str(q_path), mmap_mode="r"), np.load(str(ids_path), mmap_mode="r"), meta
+
+
+def hashed_embeddings_for_local(args: argparse.Namespace, texts: Sequence[str], q_texts: Sequence[str], ui: UI) -> Tuple[Any, Any, Any, Dict[str, Any]]:
+    np = import_numpy()
+    cache_dir = Path(args.cache_dir).expanduser()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    h = hashlib.sha256()
+    for t in list(texts) + list(q_texts):
+        h.update(t.encode("utf-8", errors="ignore")); h.update(b"\0")
+    key = stable_hash({"version": 4, "kind": "local-hash", "text_hash": h.hexdigest(), "dim": args.embedding_dim}, 20)
+    db_path = cache_dir / f"localhash_db_{key}.npy"
+    q_path = cache_dir / f"localhash_q_{key}.npy"
+    ids_path = cache_dir / f"localhash_qids_{key}.npy"
+    meta_path = cache_dir / f"localhash_meta_{key}.json"
+    if not args.refresh_cache and db_path.exists() and q_path.exists() and ids_path.exists() and meta_path.exists():
+        return np.load(str(db_path), mmap_mode="r"), np.load(str(q_path), mmap_mode="r"), np.load(str(ids_path), mmap_mode="r"), json.loads(meta_path.read_text())
+    token_re = re.compile(r"[a-z0-9][a-z0-9_-]*")
+    def token_hash(tok: str) -> Tuple[int, float]:
+        d = hashlib.blake2b(tok.encode(), digest_size=8).digest()
+        v = int.from_bytes(d, "little")
+        return v % args.embedding_dim, 1.0 if ((v >> 63) & 1) == 0 else -1.0
+    def embed(seq: Sequence[str], label: str) -> Any:
+        arr = np.zeros((len(seq), args.embedding_dim), dtype=np.float32)
+        cache: Dict[str, Tuple[int, float]] = {}
+        for i, text in enumerate(seq):
+            for tok in token_re.findall(text.lower())[:256]:
+                idx, sign = cache.get(tok) or token_hash(tok)
+                cache[tok] = (idx, sign)
+                arr[i, idx] += sign
+            n = float(np.linalg.norm(arr[i]))
+            if n > 0:
+                arr[i] /= n
+            ui.progress(label, i + 1, len(seq))
+        return arr
+    db = embed(texts, "Local corpus vectors")
+    q = embed(q_texts, "Local query vectors")
+    qids = np.array([((i * 9973 + 17) % len(texts)) for i in range(len(q_texts))], dtype=np.int64)
+    np.save(str(db_path), db); np.save(str(q_path), q); np.save(str(ids_path), qids)
+    meta = {"source": "local-jsonl", "license": require_permissive(args.corpus_license), "cache_key": key, "notes": "Local JSONL corpus; user-declared permissive license."}
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return np.load(str(db_path), mmap_mode="r"), np.load(str(q_path), mmap_mode="r"), np.load(str(ids_path), mmap_mode="r"), meta
 
 
 class NumpyFlatIndex:
     name = "numpy_flat_inner_product"
-
     def __init__(self, vectors: Any):
-        np = import_numpy()
-        self.vectors = np.asarray(vectors, dtype=np.float32).copy()
-        self.ntotal = int(self.vectors.shape[0])
-        self.dim = int(self.vectors.shape[1])
-
-    def search(self, queries: Any, k: int):
-        np = import_numpy()
-        q = np.asarray(queries, dtype=np.float32)
-        if q.ndim == 1:
-            q = q.reshape(1, -1)
-        k = min(k, self.vectors.shape[0])
-        chunk = 128
-        all_d: List[Any] = []
-        all_i: List[Any] = []
-        for start in range(0, q.shape[0], chunk):
-            sub = q[start:start + chunk]
-            sims = sub @ self.vectors.T
-            idx = np.argpartition(-sims, kth=k - 1, axis=1)[:, :k]
-            vals = np.take_along_axis(sims, idx, axis=1)
-            order = np.argsort(-vals, axis=1)
-            idx = np.take_along_axis(idx, order, axis=1)
-            vals = np.take_along_axis(vals, order, axis=1)
-            all_d.append(vals.astype(np.float32, copy=False))
-            all_i.append(idx.astype(np.int64, copy=False))
-        return np.vstack(all_d), np.vstack(all_i)
+        self.np = import_numpy()
+        self.vectors = self.np.array(vectors, dtype=self.np.float32, copy=True)
+    def search(self, q: Any, k: int) -> Tuple[Any, Any]:
+        scores = self.np.asarray(q, dtype=self.np.float32) @ self.vectors.T
+        if k >= scores.shape[1]:
+            idx = self.np.argsort(-scores, axis=1)[:, :k]
+        else:
+            part = self.np.argpartition(-scores, kth=k-1, axis=1)[:, :k]
+            vals = self.np.take_along_axis(scores, part, axis=1)
+            order = self.np.argsort(-vals, axis=1)
+            idx = self.np.take_along_axis(part, order, axis=1)
+        vals = self.np.take_along_axis(scores, idx, axis=1)
+        return vals, idx
 
 
-def build_index(vectors: Any, args: argparse.Namespace, backend: str):
+def choose_backend(name: str) -> str:
+    if name == "numpy":
+        return "numpy"
+    if name == "faiss":
+        import_faiss(required=True)
+        return "faiss"
+    if import_faiss(required=False) is not None:
+        return "faiss"
+    return "numpy"
+
+
+def build_index(vectors: Any, args: argparse.Namespace, backend: str, threads: Optional[int] = None):
     np = import_numpy()
-    vecs = np.asarray(vectors, dtype=np.float32)
+    vecs = np.array(vectors, dtype=np.float32, copy=True)
     if backend == "numpy":
         return NumpyFlatIndex(vecs)
-    import faiss  # type: ignore
-    if args.threads and args.threads > 0:
-        faiss.omp_set_num_threads(args.threads)
+    faiss = import_faiss(required=True)
+    if threads is not None:
+        try:
+            faiss.omp_set_num_threads(max(1, int(threads)))
+        except Exception:
+            pass
     dim = int(vecs.shape[1])
     try:
-        index = faiss.IndexHNSWFlat(dim, int(args.hnsw_m), faiss.METRIC_INNER_PRODUCT)
+        idx = faiss.IndexHNSWFlat(dim, int(args.hnsw_m), faiss.METRIC_INNER_PRODUCT)
     except TypeError:
-        index = faiss.IndexHNSWFlat(dim, int(args.hnsw_m))
-    index.hnsw.efConstruction = int(args.hnsw_ef_construction)
-    index.add(vecs)
-    index.hnsw.efSearch = int(args.hnsw_ef)
-    return index
+        idx = faiss.IndexHNSWFlat(dim, int(args.hnsw_m))
+    idx.hnsw.efConstruction = int(args.hnsw_ef_construction)
+    idx.add(vecs)
+    idx.hnsw.efSearch = int(args.hnsw_ef)
+    return idx
 
 
-def index_name(index: Any, backend: str) -> str:
-    if backend == "numpy":
-        return getattr(index, "name", "numpy")
-    return "faiss_hnsw_inner_product"
-
-
-def select_queries(q_embeddings: Any, count: int, seed: int):
-    np = import_numpy()
-    rng = np.random.default_rng(seed)
-    if q_embeddings.shape[0] >= count:
-        idx = rng.choice(q_embeddings.shape[0], size=count, replace=False)
-    else:
-        idx = rng.choice(q_embeddings.shape[0], size=count, replace=True)
-    return q_embeddings[idx]
-
-
-def run_build_benchmark(args: argparse.Namespace, db_embeddings: Any, db_sizes: Sequence[int], backend: str, ui: UI) -> List[Dict[str, Any]]:
-    results: List[Dict[str, Any]] = []
+def run_index_build(args: argparse.Namespace, db: Any, db_sizes: Sequence[int], backend: str, ui: UI) -> List[Dict[str, Any]]:
     if args.skip_build:
-        return results
-    ui.rule("HNSW index build")
-    for size in db_sizes:
-        times: List[float] = []
-        for r in range(args.runs):
-            gc.collect()
-            t0 = time.perf_counter()
-            idx = build_index(db_embeddings[:size], args, backend)
-            elapsed = time.perf_counter() - t0
-            times.append(elapsed)
-            del idx
-            ui.progress(f"Build DB={size:,}", r + 1, args.runs)
-            if args.cooldown > 0 and r + 1 < args.runs:
-                time.sleep(args.cooldown)
-        summary = summarize_seconds(times, args.trim)
-        results.append({
-            "db_size": int(size),
-            "backend": backend,
-            "index": "faiss_hnsw_inner_product" if backend == "faiss" else "numpy_flat_build_copy",
-            "times_seconds": [round(t, 6) for t in times],
-            "summary": summary,
-        })
-    return results
-
-
-def run_search_benchmark(args: argparse.Namespace, db_embeddings: Any, q_embeddings: Any, db_sizes: Sequence[int], backend: str, ui: UI) -> List[Dict[str, Any]]:
+        return []
+    ui.rule("Index build benchmark")
+    old_gc = gc.isenabled(); gc.disable()
     results: List[Dict[str, Any]] = []
-    if args.skip_search:
-        return results
-    ui.rule("Batch vector search")
-    for size in db_sizes:
-        ui.print(f"Building search index for DB={size:,} ...")
-        idx = build_index(db_embeddings[:size], args, backend)
-        qps_values: List[float] = []
-        elapsed_values: List[float] = []
-        for r in range(args.runs):
-            qs = select_queries(q_embeddings, args.batch_queries, seed=1000 + r + size)
-            t0 = time.perf_counter()
-            idx.search(qs, args.top_k)
-            elapsed = time.perf_counter() - t0
-            qps = args.batch_queries / elapsed if elapsed > 0 else 0.0
-            qps_values.append(qps)
-            elapsed_values.append(elapsed)
-            ui.progress(f"Search DB={size:,}", r + 1, args.runs)
-            if args.cooldown > 0 and r + 1 < args.runs:
-                time.sleep(args.cooldown)
-        results.append({
-            "db_size": int(size),
-            "backend": backend,
-            "index": index_name(idx, backend),
-            "top_k": int(args.top_k),
-            "batch_queries": int(args.batch_queries),
-            "qps": summarize_rate(qps_values, args.trim),
-            "elapsed_seconds": [round(t, 6) for t in elapsed_values],
-        })
-        del idx
-        gc.collect()
+    try:
+        for size in db_sizes:
+            if backend == "faiss":
+                faiss = import_faiss(required=True)
+                try: faiss.omp_set_num_threads(os.cpu_count() or 1)
+                except Exception: pass
+            times: List[float] = []
+            for r in range(args.build_runs):
+                t0 = time.perf_counter()
+                idx = build_index(db[:size], args, backend, threads=os.cpu_count() or 1)
+                elapsed = time.perf_counter() - t0
+                times.append(elapsed)
+                del idx
+                gc.collect()
+                ui.progress(f"Index build {size//1000}K", r + 1, args.build_runs)
+                if args.cooldown > 0 and r + 1 < args.build_runs:
+                    time.sleep(args.cooldown)
+            summary = summarize_seconds(times, args.trim)
+            summary["vectors_per_s"] = round(size / max(summary["mean_s"], 1e-9), 3)
+            results.append({
+                "db_size": int(size), "backend": backend,
+                "index": "faiss_hnsw_inner_product" if backend == "faiss" else "numpy_flat_inner_product",
+                "hnsw_m": args.hnsw_m, "ef_construction": args.hnsw_ef_construction,
+                "summary": summary,
+            })
+    finally:
+        if old_gc: gc.enable()
     return results
 
 
-def http_headers(api_key: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    headers = {"Content-Type": "application/json"}
-    if api_key is not None and api_key != "":
-        headers["Authorization"] = f"Bearer {api_key}"
-    if extra:
-        headers.update(extra)
-    return headers
+def run_batch_search(args: argparse.Namespace, db: Any, q: Any, db_sizes: Sequence[int], backend: str, ui: UI) -> List[Dict[str, Any]]:
+    if args.skip_search:
+        return []
+    ui.rule("Batch vector search benchmark")
+    old_gc = gc.isenabled(); gc.disable()
+    results: List[Dict[str, Any]] = []
+    try:
+        needed = args.batch_queries * (args.warmup_batches + args.runs)
+        if q.shape[0] < needed:
+            raise SystemExit(f"Internal error: not enough query vectors ({q.shape[0]}) for needed workload ({needed}).")
+        for size in db_sizes:
+            ui.print(f"Building FAISS/HNSW search index for DB={size:,} ..." if backend == "faiss" else f"Building NumPy search index for DB={size:,} ...")
+            idx = build_index(db[:size], args, backend, threads=os.cpu_count() or 1)
+            # Warmup uses fixed query slices, then timed runs use fixed query slices.
+            for w in range(args.warmup_batches):
+                start = w * args.batch_queries
+                end = start + args.batch_queries
+                idx.search(q[start:end], args.top_k)
+                ui.progress(f"Warmup {size//1000}K", w + 1, args.warmup_batches)
+            qps_runs: List[float] = []
+            elapsed_runs: List[float] = []
+            base = args.warmup_batches * args.batch_queries
+            for r in range(args.runs):
+                start = base + r * args.batch_queries
+                end = start + args.batch_queries
+                t0 = time.perf_counter()
+                idx.search(q[start:end], args.top_k)
+                elapsed = time.perf_counter() - t0
+                elapsed_runs.append(elapsed)
+                qps_runs.append(args.batch_queries / max(elapsed, 1e-9))
+                ui.progress(f"Batch search {size//1000}K", r + 1, args.runs)
+                if args.cooldown > 0 and r + 1 < args.runs:
+                    time.sleep(args.cooldown)
+            results.append({
+                "db_size": int(size), "backend": backend,
+                "index": "faiss_hnsw_inner_product" if backend == "faiss" else "numpy_flat_inner_product",
+                "top_k": args.top_k, "batch_queries": args.batch_queries,
+                "qps": summarize_rates(qps_runs, args.trim),
+                "elapsed_seconds": [round(float(x), 6) for x in elapsed_runs],
+            })
+            del idx
+            gc.collect()
+    finally:
+        if old_gc: gc.enable()
+    return results
+
+
+def normalize_base_url(url: str) -> str:
+    u = (url or "").strip().rstrip("/")
+    if not u:
+        return ""
+    if not u.endswith("/v1"):
+        u += "/v1"
+    return u
+
+
+def http_headers(api_key: str) -> Dict[str, str]:
+    h = {"Content-Type": "application/json"}
+    if api_key:
+        h["Authorization"] = f"Bearer {api_key}"
+    return h
 
 
 def http_json(method: str, url: str, api_key: str, payload: Optional[Dict[str, Any]], timeout: float) -> Dict[str, Any]:
@@ -1559,526 +1093,555 @@ def http_json(method: str, url: str, api_key: str, payload: Optional[Dict[str, A
 
 def detect_model(base: str, api_key: str, timeout: float) -> Optional[str]:
     try:
-        data = http_json("GET", models_url(base), api_key, None, timeout)
-        items = data.get("data") or []
-        for item in items:
-            mid = item.get("id") if isinstance(item, dict) else None
-            if mid:
-                return str(mid)
+        data = http_json("GET", base + "/models", api_key, None, timeout)
+        for item in data.get("data", []):
+            if isinstance(item, dict) and item.get("id"):
+                return str(item["id"])
     except Exception:
         return None
     return None
 
 
-def chat_completion(base: str, api_key: str, model: str, messages: List[Dict[str, str]], args: argparse.Namespace) -> Dict[str, Any]:
-    payload = {
+def make_messages(question: str, contexts: Sequence[str], context_chars: int) -> List[Dict[str, str]]:
+    context = "\n\n".join(contexts)[:context_chars]
+    return [
+        {"role": "system", "content": "You answer using only the supplied synthetic benchmark context. Keep the answer to one short sentence."},
+        {"role": "user", "content": f"Context:\n{context}\n\nQuestion:\n{question}\n\nAnswer briefly:"},
+    ]
+
+
+def parse_stream_line(line: bytes) -> Optional[str]:
+    s = line.decode("utf-8", errors="replace").strip()
+    if not s or s.startswith(":"):
+        return None
+    if s.startswith("data:"):
+        data = s[5:].strip()
+    else:
+        data = s
+    if data == "[DONE]":
+        return "__DONE__"
+    try:
+        obj = json.loads(data)
+    except Exception:
+        return None
+    try:
+        ch = obj.get("choices", [{}])[0]
+        delta = ch.get("delta") or {}
+        if isinstance(delta, dict) and delta.get("content"):
+            return str(delta.get("content"))
+        msg = ch.get("message") or {}
+        if isinstance(msg, dict) and msg.get("content"):
+            return str(msg.get("content"))
+        if ch.get("text"):
+            return str(ch.get("text"))
+    except Exception:
+        return None
+    return None
+
+
+def chat_completion(base: str, api_key: str, model: str, messages: List[Dict[str, str]], args: argparse.Namespace, qid: int) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
         "model": model,
         "messages": messages,
         "temperature": args.temperature,
         "max_tokens": args.max_tokens,
         "stream": not args.no_stream,
     }
-    if args.no_stream:
-        return chat_completion_nonstream(base, api_key, payload, args.request_timeout)
+    if args.send_seed:
+        payload["seed"] = int(args.request_seed + qid)
+    url = base + "/chat/completions"
+    start = time.perf_counter()
+    stream_fallback = False
+    chars = 0
+    first: Optional[float] = None
+    if payload["stream"]:
+        req = Request(url, data=json.dumps(payload).encode("utf-8"), headers=http_headers(api_key), method="POST")
+        try:
+            with urlopen(req, timeout=args.request_timeout) as resp:
+                while True:
+                    line = resp.readline()
+                    if not line:
+                        break
+                    token = parse_stream_line(line)
+                    if token is None:
+                        continue
+                    if token == "__DONE__":
+                        break
+                    if first is None:
+                        first = time.perf_counter()
+                    chars += len(token)
+            end = time.perf_counter()
+            return {"ok": True, "ttft_s": (first or end) - start, "total_s": end - start, "chars": chars, "stream_fallback": False}
+        except Exception:
+            if not args.allow_stream_fallback:
+                raise
+            stream_fallback = True
+            payload["stream"] = False
+    data = http_json("POST", url, api_key, payload, args.request_timeout)
+    end = time.perf_counter()
+    text = ""
     try:
-        return chat_completion_stream(base, api_key, payload, args.request_timeout)
-    except Exception as exc:
-        if args.disable_nonstream_fallback:
-            raise
-        fallback_payload = dict(payload)
-        fallback_payload["stream"] = False
-        data = chat_completion_nonstream(base, api_key, fallback_payload, args.request_timeout)
-        data["stream_fallback_error"] = str(exc)
-        return data
+        text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    except Exception:
+        text = ""
+    return {"ok": True, "ttft_s": end - start, "total_s": end - start, "chars": len(text), "stream_fallback": stream_fallback}
 
 
-def chat_completion_nonstream(base: str, api_key: str, payload: Dict[str, Any], timeout: float) -> Dict[str, Any]:
-    t0 = time.perf_counter()
-    data = http_json("POST", chat_url(base), api_key, payload, timeout)
-    total = time.perf_counter() - t0
-    content = ""
-    choices = data.get("choices") or []
-    if choices:
-        msg = choices[0].get("message") or {}
-        content = str(msg.get("content") or "")
-    usage = data.get("usage") or {}
-    return {
-        "ttft_seconds": total,
-        "total_seconds": total,
-        "content": content,
-        "output_chars": len(content),
-        "approx_output_tokens": max(1, len(content.split())) if content else 0,
-        "usage": usage,
-        "streamed": False,
-    }
+def get_contexts(indices: Iterable[int], local_texts: Optional[Sequence[str]], args: argparse.Namespace) -> List[str]:
+    out: List[str] = []
+    for i in indices:
+        ii = int(i)
+        if local_texts is not None:
+            out.append(str(local_texts[ii % len(local_texts)]))
+        else:
+            out.append(doc_text(ii, args.cluster_count, args.seed))
+    return out
 
 
-def chat_completion_stream(base: str, api_key: str, payload: Dict[str, Any], timeout: float) -> Dict[str, Any]:
-    data = json.dumps(payload).encode("utf-8")
-    req = Request(chat_url(base), data=data, headers=http_headers(api_key, {"Accept": "text/event-stream"}), method="POST")
-    t0 = time.perf_counter()
-    first_content: Optional[float] = None
-    chunks: List[str] = []
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            for raw in resp:
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line or line.startswith(":"):
-                    continue
-                if not line.startswith("data:"):
-                    continue
-                value = line[5:].strip()
-                if value == "[DONE]":
-                    break
-                try:
-                    event = json.loads(value)
-                except json.JSONDecodeError:
-                    continue
-                choices = event.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("delta") or {}
-                content = delta.get("content") or ""
-                if content:
-                    if first_content is None:
-                        first_content = time.perf_counter() - t0
-                    chunks.append(str(content))
-    except HTTPError as exc:
-        body = exc.read(4000).decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code} from {chat_url(base)}: {body}") from exc
-    except URLError as exc:
-        raise RuntimeError(f"Connection error for {chat_url(base)}: {exc}") from exc
-    total = time.perf_counter() - t0
-    content = "".join(chunks)
-    return {
-        "ttft_seconds": first_content if first_content is not None else total,
-        "total_seconds": total,
-        "content": content,
-        "output_chars": len(content),
-        "approx_output_tokens": max(1, len(content.split())) if content else 0,
-        "usage": {},
-        "streamed": True,
-    }
-
-
-def probe_endpoint(args: argparse.Namespace, ui: UI) -> Tuple[str, str, Dict[str, Any]]:
-    endpoint = normalize_endpoint(args.endpoint or args.endpoint_pos or "")
-    model = args.model
-    detected = None
-    if not model:
-        detected = detect_model(endpoint, args.api_key, args.connect_timeout)
-        if detected:
-            model = detected
-    if not model:
-        raise SystemExit("Model id is required because /v1/models did not return an id. Re-run with --model MODEL_ID.")
-    messages = [
-        {"role": "system", "content": "Reply with a short health-check phrase."},
-        {"role": "user", "content": "health check"},
-    ]
-    probe_args = argparse.Namespace(**vars(args))
-    probe_args.no_stream = True
-    probe_args.max_tokens = min(args.max_tokens, 8)
-    t0 = time.perf_counter()
-    resp = chat_completion(endpoint, args.api_key, model, messages, probe_args)
-    elapsed = time.perf_counter() - t0
-    info = {
-        "base_url": endpoint,
-        "chat_url": chat_url(endpoint),
-        "models_url": models_url(endpoint),
-        "model": model,
-        "model_auto_detected": detected is not None,
-        "probe_seconds": round(elapsed, 4),
-        "probe_output_chars": resp.get("output_chars", 0),
-    }
-    ui.print(ui.green(f"Endpoint OK: {endpoint} model={model} probe={elapsed*1000:.1f} ms"))
-    return endpoint, model, info
-
-
-def make_rag_messages(question: str, contexts: Sequence[str], context_chars: int) -> List[Dict[str, str]]:
-    joined_parts: List[str] = []
-    used = 0
-    for i, ctx in enumerate(contexts, 1):
-        part = f"[Context {i}] {clean_text(ctx, 900)}"
-        if used + len(part) > context_chars:
-            remain = max(0, context_chars - used)
-            if remain > 80:
-                joined_parts.append(part[:remain])
-            break
-        joined_parts.append(part)
-        used += len(part)
-    context = "\n".join(joined_parts)
-    user = (
-        "Use only the context below. If the answer is not in the context, say that the context is insufficient.\n\n"
-        f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer in two concise sentences."
-    )
-    return [
-        {"role": "system", "content": "You are a precise RAG benchmark answerer."},
-        {"role": "user", "content": user},
-    ]
-
-
-def run_rag_benchmark(args: argparse.Namespace, endpoint: str, model: str, db_texts: List[str], db_embeddings: Any, q_texts: List[str], q_embeddings: Any, backend: str, ui: UI) -> Dict[str, Any]:
+def run_rag(args: argparse.Namespace, base: str, api_key: str, model: str, db: Any, q: Any, qids: Any, backend: str, local_texts: Optional[Sequence[str]], ui: UI) -> Dict[str, Any]:
     if args.skip_rag:
         return {}
-    np = import_numpy()
+    ui.rule("Concurrent RAG benchmark")
     workers = args.rag_workers or min(os.cpu_count() or 1, 8)
-    rag_db_size = min(args.rag_db_size, len(db_texts), int(db_embeddings.shape[0]))
-    total_per_run = workers * args.rag_queries_per_worker
-    ui.rule("Concurrent RAG")
-    ui.print(f"Building RAG retrieval index: db={rag_db_size:,}, workers={workers}, requests/run={total_per_run}")
-    retrieval_index = build_index(db_embeddings[:rag_db_size], args, backend)
+    workers = max(1, min(int(workers), 64))
+    rag_db = min(int(args.rag_db_size), int(db.shape[0]))
+    total_per_run = workers * int(args.rag_queries_per_worker)
+    if q.shape[0] < total_per_run:
+        raise SystemExit("Internal error: not enough query vectors for RAG workload")
+    if backend == "faiss":
+        faiss = import_faiss(required=True)
+        try: faiss.omp_set_num_threads(1)
+        except Exception: pass
+    ui.print(f"Preparing {workers} per-worker retrieval indexes: rag_db={rag_db:,}, top_k={args.top_k}")
+    worker_indexes = []
+    for w in range(workers):
+        worker_indexes.append(build_index(db[:rag_db], args, backend, threads=1))
+        ui.progress("RAG worker indexes", w + 1, workers)
 
     all_ttft: List[float] = []
     all_total: List[float] = []
     all_retrieval: List[float] = []
-    run_rows: List[Dict[str, Any]] = []
-    errors: List[str] = []
-    completed_total = 0
+    run_tps: List[float] = []
+    error_samples: List[str] = []
+    stream_fallbacks = 0
+    completed = 0
+    errors = 0
     chars_total = 0
-    approx_tokens_total = 0
-    fallback_count = 0
+    lock = threading.Lock()
 
-    def one_request(global_qid: int) -> Dict[str, Any]:
-        qid = global_qid % len(q_texts)
-        qv = np.asarray(q_embeddings[qid:qid + 1], dtype=np.float32)
-        rt0 = time.perf_counter()
-        _, ids = retrieval_index.search(qv, args.top_k)
-        retrieval_seconds = time.perf_counter() - rt0
-        doc_ids = [int(x) for x in ids[0].tolist() if int(x) >= 0]
-        contexts = [db_texts[i] for i in doc_ids[: args.top_k]]
-        messages = make_rag_messages(q_texts[qid], contexts, args.context_chars)
-        resp = chat_completion(endpoint, args.api_key, model, messages, args)
-        return {
-            "retrieval_seconds": retrieval_seconds,
-            "ttft_seconds": float(resp["ttft_seconds"]),
-            "total_seconds": float(resp["total_seconds"]),
-            "output_chars": int(resp.get("output_chars", 0)),
-            "approx_output_tokens": int(resp.get("approx_output_tokens", 0)),
-            "streamed": bool(resp.get("streamed")),
-            "fallback": "stream_fallback_error" in resp,
-            "doc_ids": doc_ids[: args.top_k],
-        }
+    def one_request(worker_id: int, local_j: int) -> Dict[str, Any]:
+        q_index = worker_id * args.rag_queries_per_worker + local_j
+        qv = q[q_index:q_index + 1]
+        rid = int(qids[q_index]) if qids is not None else q_index
+        t0 = time.perf_counter()
+        _, inds = worker_indexes[worker_id].search(qv, args.top_k)
+        retrieval_s = time.perf_counter() - t0
+        contexts = get_contexts(inds[0], local_texts, args)
+        top_doc = int(inds[0][0]) if len(inds[0]) else rid
+        question = question_for_doc(top_doc, q_index, args.cluster_count, args.seed)
+        messages = make_messages(question, contexts, args.context_chars)
+        r = chat_completion(base, api_key, model, messages, args, q_index)
+        r["retrieval_s"] = retrieval_s
+        return r
 
-    for run in range(args.rag_runs):
-        run_t0 = time.perf_counter()
-        run_completed = 0
-        run_chars = 0
-        run_tokens = 0
-        run_errors = 0
+    # Warm up endpoint with a fixed minimal request.
+    try:
+        warm_msg = [{"role": "user", "content": "Reply with: ready"}]
+        chat_completion(base, api_key, model, warm_msg, args, 0)
+    except Exception as exc:
+        ui.print(ui.yellow(f"Endpoint warmup warning: {str(exc)[:180]}"))
+
+    for run_i in range(args.rag_runs):
+        start = time.perf_counter()
         futures = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            base_qid = run * total_per_run
-            for j in range(total_per_run):
-                futures.append(pool.submit(one_request, base_qid + j))
-            for n, fut in enumerate(concurrent.futures.as_completed(futures), 1):
+            for w in range(workers):
+                for j in range(args.rag_queries_per_worker):
+                    futures.append(pool.submit(one_request, w, j))
+            done_count = 0
+            for fut in concurrent.futures.as_completed(futures):
+                done_count += 1
                 try:
-                    item = fut.result()
-                    run_completed += 1
-                    completed_total += 1
-                    run_chars += item["output_chars"]
-                    run_tokens += item["approx_output_tokens"]
-                    chars_total += item["output_chars"]
-                    approx_tokens_total += item["approx_output_tokens"]
-                    fallback_count += 1 if item.get("fallback") else 0
-                    all_retrieval.append(item["retrieval_seconds"])
-                    all_ttft.append(item["ttft_seconds"])
-                    all_total.append(item["total_seconds"])
+                    r = fut.result()
+                    with lock:
+                        completed += 1
+                        all_ttft.append(float(r.get("ttft_s", 0.0)))
+                        all_total.append(float(r.get("total_s", 0.0)))
+                        all_retrieval.append(float(r.get("retrieval_s", 0.0)))
+                        chars_total += int(r.get("chars", 0))
+                        stream_fallbacks += 1 if r.get("stream_fallback") else 0
                 except Exception as exc:
-                    run_errors += 1
-                    msg = str(exc)
-                    errors.append(msg)
-                    if args.fail_on_endpoint_error:
-                        raise
-                ui.progress(f"RAG run {run + 1}/{args.rag_runs}", n, total_per_run)
-        wall = time.perf_counter() - run_t0
-        row = {
-            "run": run + 1,
-            "requests": total_per_run,
-            "completed": run_completed,
-            "errors": run_errors,
-            "wall_seconds": round(wall, 6),
-            "requests_per_second": round(run_completed / wall, 4) if wall > 0 else 0.0,
-            "chars_per_second": round(run_chars / wall, 3) if wall > 0 else 0.0,
-            "approx_tokens_per_second": round(run_tokens / wall, 3) if wall > 0 else 0.0,
-        }
-        run_rows.append(row)
-        if args.cooldown > 0 and run + 1 < args.rag_runs:
+                    with lock:
+                        errors += 1
+                        if len(error_samples) < 5:
+                            error_samples.append(str(exc)[:500])
+                ui.progress(f"RAG run {run_i + 1}/{args.rag_runs}", done_count, total_per_run)
+        wall = time.perf_counter() - start
+        run_tps.append(total_per_run / max(wall, 1e-9))
+        if args.cooldown > 0 and run_i + 1 < args.rag_runs:
             time.sleep(args.cooldown)
 
-    wall_sum = sum(r["wall_seconds"] for r in run_rows)
+    for idx in worker_indexes:
+        del idx
+    gc.collect()
     return {
-        "backend": backend,
-        "index": "faiss_hnsw_inner_product" if backend == "faiss" else "numpy_flat_inner_product",
-        "rag_db_size": rag_db_size,
         "workers": workers,
         "runs": args.rag_runs,
         "queries_per_worker": args.rag_queries_per_worker,
-        "top_k": args.top_k,
-        "completed": completed_total,
-        "errors": len(errors),
-        "error_samples": errors[:5],
-        "stream_fallback_count": fallback_count,
-        "requests_per_second_mean": round(mean([r["requests_per_second"] for r in run_rows]), 4),
-        "requests_per_second_runs": [r["requests_per_second"] for r in run_rows],
-        "chars_per_second_mean": round(chars_total / wall_sum, 3) if wall_sum > 0 else 0.0,
-        "approx_tokens_per_second_mean": round(approx_tokens_total / wall_sum, 3) if wall_sum > 0 else 0.0,
-        "retrieval_latency": summarize_seconds(all_retrieval),
-        "ttft_latency": summarize_seconds(all_ttft),
-        "total_latency": summarize_seconds(all_total),
-        "run_rows": run_rows,
+        "rag_db_size": rag_db,
+        "total_attempted": total_per_run * args.rag_runs,
+        "completed": completed,
+        "errors": errors,
+        "requests_per_second": summarize_rates(run_tps, args.trim),
+        "ttft_latency": latency_summary(all_ttft),
+        "total_latency": latency_summary(all_total),
+        "retrieval_latency": latency_summary(all_retrieval),
+        "chars_total": chars_total,
+        "chars_per_second_mean": round(chars_total / max(sum(all_total), 1e-9), 6) if all_total else 0.0,
+        "stream_fallback_count": stream_fallbacks,
+        "error_samples": error_samples,
     }
 
 
-class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    daemon_threads = True
+class MockHandler(BaseHTTPRequestHandler):
+    server_version = "RagBenchmarkMock/1.0"
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
+    def _send(self, code: int, body: bytes, content_type: str = "application/json") -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def do_GET(self) -> None:
+        if self.path.rstrip("/") == "/v1/models":
+            self._send(200, json.dumps({"object":"list","data":[{"id":"mock-rag-model","object":"model"}]}).encode())
+        else:
+            self._send(404, b"{}")
+    def do_POST(self) -> None:
+        if self.path.rstrip("/") != "/v1/chat/completions":
+            self._send(404, b"{}")
+            return
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        if payload.get("stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for token in ["Synthetic ", "RAG ", "answer."]:
+                chunk = {"choices":[{"delta":{"content":token}}]}
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode()); self.wfile.flush(); time.sleep(0.005)
+            self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
+        else:
+            body = {"choices":[{"message":{"content":"Synthetic RAG answer."}}], "model": payload.get("model", "mock-rag-model")}
+            self._send(200, json.dumps(body).encode())
 
 
 def start_mock_server() -> Tuple[str, ThreadingHTTPServer]:
-    class Handler(http.server.BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-
-        def log_message(self, format: str, *args: Any) -> None:
-            return
-
-        def do_GET(self) -> None:
-            if self.path.rstrip("/") == "/v1/models":
-                body = json.dumps({"object": "list", "data": [{"id": "mock-rag-model", "object": "model"}]}).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            else:
-                self.send_response(404)
-                self.end_headers()
-
-        def do_POST(self) -> None:
-            length = int(self.headers.get("Content-Length", "0") or "0")
-            raw = self.rfile.read(length) if length else b"{}"
-            try:
-                payload = json.loads(raw.decode("utf-8"))
-            except Exception:
-                payload = {}
-            stream = bool(payload.get("stream"))
-            content = "Mock RAG answer: the supplied context contains the requested retrieval key."
-            if self.path.rstrip("/") != "/v1/chat/completions":
-                self.send_response(404)
-                self.end_headers()
-                return
-            if stream:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "close")
-                self.end_headers()
-                for piece in ["Mock RAG answer: ", "the supplied context ", "contains the requested retrieval key."]:
-                    evt = {"choices": [{"delta": {"content": piece}, "index": 0}]}
-                    self.wfile.write(("data: " + json.dumps(evt) + "\n\n").encode())
-                    self.wfile.flush()
-                    time.sleep(0.005)
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
-            else:
-                body = json.dumps({
-                    "id": "mock", "object": "chat.completion", "model": payload.get("model", "mock-rag-model"),
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
-                    "usage": {"prompt_tokens": 10, "completion_tokens": 12, "total_tokens": 22},
-                }).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    host, port = sock.getsockname()
-    sock.close()
-    server = ThreadingHTTPServer((host, port), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return f"http://{host}:{port}/v1", server
+    server = ThreadingHTTPServer(("127.0.0.1", 0), MockHandler)
+    th = threading.Thread(target=server.serve_forever, daemon=True)
+    th.start()
+    return f"http://127.0.0.1:{server.server_address[1]}/v1", server
 
 
 def license_audit(ui: UI) -> Dict[str, Any]:
     audit = {
-        "policy": "Default benchmark path uses only permissively licensed direct dependencies and a generated local corpus.",
-        "direct_components": DIRECT_LICENSES,
-        "accepted_local_corpus_licenses": sorted(PERMISSIVE_LICENSES),
-        "rejected_by_default": ["GPL family", "AGPL", "LGPL", "CC-BY-SA", "CC-BY-NC", "proprietary", "unknown/no license"],
-        "notes": [
-            "The default synthetic corpus is generated locally and contains no third-party database/source text.",
-            "A local JSONL corpus is allowed only when --corpus-license declares a known permissive license.",
-            "This script does not download Hugging Face datasets, Wikipedia dumps, or external embedding models.",
-            "Bash, curl, OS libraries, and system package managers are treated as the user's execution environment, not bundled benchmark artifacts.",
-            "Packages supplied through --extra-pip are user-selected and are not covered by this built-in audit.",
-            "This is engineering metadata, not legal advice.",
+        "script": {"component": "rag_benchmark.sh", "license": "MIT", "source": "this repository"},
+        "runtime_dependencies": [
+            {"component": "Python", "license": "PSF-2.0-compatible", "role": "runtime"},
+            {"component": "NumPy", "license": "BSD-3-Clause", "role": "array math"},
+            {"component": "faiss-cpu", "license": "MIT", "role": "FAISS HNSW vector index"},
         ],
+        "default_corpus": {"source": "synthetic-generated-local", "license": "MIT synthetic fixture / no third-party source text"},
+        "accepted_local_corpus_licenses": sorted(PERMISSIVE_LICENSES),
+        "note": "No third-party database text, Wikipedia dumps, Hugging Face datasets, or downloaded embedding models are used by the default benchmark path.",
     }
-    rows = [[c["component"], c["license"], c["role"]] for c in DIRECT_LICENSES]
-    ui.table("License audit", ["component", "license", "role"], rows)
-    ui.print("Accepted local corpus licenses: " + ", ".join(audit["accepted_local_corpus_licenses"]))
-    ui.print("Default corpus: generated locally; no third-party source text.")
+    ui.box("License audit", [
+        "Script: MIT",
+        "Default corpus: synthetic local fixture; no third-party source text",
+        "Direct Python packages: NumPy (BSD-3-Clause), faiss-cpu (MIT)",
+        "Local JSONL corpora require a declared permissive SPDX license",
+    ])
     return audit
 
 
-def print_start_dashboard(args: argparse.Namespace, ui: UI, endpoint_info: Optional[Dict[str, Any]], corpus_info: Optional[Dict[str, Any]], backend: str, sysinfo: Dict[str, Any]) -> None:
-    lines = [
+def probe_endpoint(args: argparse.Namespace, ui: UI) -> Tuple[str, str, Dict[str, Any]]:
+    base = normalize_base_url(args.endpoint or os.environ.get("RAG_ENDPOINT", ""))
+    api_key = args.api_key if args.api_key is not None else os.environ.get("OPENAI_API_KEY", "")
+    model = args.model or os.environ.get("RAG_MODEL", "")
+    if not base:
+        raise SystemExit("--endpoint is required unless --self-test or --license-audit is used")
+    detected = None
+    if not model:
+        detected = detect_model(base, api_key, args.request_timeout)
+        if detected:
+            model = detected
+    if not model:
+        raise SystemExit("--model was not supplied and /v1/models did not return a model id")
+    return base, model, {"base_url": base, "model": model, "model_detected": detected is not None, "api_key_used": bool(api_key)}
+
+
+def apply_profile(args: argparse.Namespace) -> None:
+    if args.quick:
+        args.profile = "quick"
+    if args.profile == "quick":
+        args.db_sizes = args.db_sizes or "10000"
+        args.batch_queries = min(args.batch_queries, 300)
+        args.runs = min(args.runs, 3)
+        args.build_runs = min(args.build_runs, 2)
+        args.warmup_batches = min(args.warmup_batches, 1)
+        args.rag_workers = args.rag_workers or 2
+        args.rag_runs = min(args.rag_runs, 2)
+        args.rag_queries_per_worker = min(args.rag_queries_per_worker, 2)
+        args.rag_db_size = min(args.rag_db_size, 2000)
+        args.max_tokens = min(args.max_tokens, 16)
+    elif args.profile == "x3d-100k":
+        args.db_sizes = args.db_sizes or "100000"
+        if not args.rag_workers:
+            args.rag_workers = 8
+    elif args.profile == "custom":
+        args.db_sizes = args.db_sizes or "100000"
+    else:
+        raise SystemExit(f"Unknown profile: {args.profile}")
+
+
+def print_start(args: argparse.Namespace, endpoint_info: Optional[Dict[str, Any]], backend: str, sysinfo: Dict[str, Any], work_hash: str, ui: UI) -> None:
+    db_sizes = args.db_sizes or "100000"
+    workers = args.rag_workers or min(os.cpu_count() or 1, 8)
+    ui.box("X3D-STYLE RAG BENCHMARK", [
         f"Version          : {VERSION}",
+        f"Label            : {args.label}",
         f"Endpoint         : {(endpoint_info or {}).get('base_url', '<self-test/audit>')}",
         f"Model            : {(endpoint_info or {}).get('model', args.model or '<auto>')}",
+        f"Profile          : {args.profile}",
         f"Index backend    : {backend}",
-        f"Corpus           : {(corpus_info or {}).get('source', args.corpus)}",
-        f"Corpus license   : {(corpus_info or {}).get('license', 'pending')}",
-        f"DB sizes         : {args.db_sizes}",
-        f"RAG concurrency  : workers={args.rag_workers or min(os.cpu_count() or 1, 8)} runs={args.rag_runs} q/worker={args.rag_queries_per_worker}",
-        f"System           : CPUs={sysinfo['cpu_count']} RAM={sysinfo['memory_gb']} GB WSL={sysinfo['is_wsl']}",
-    ]
-    ui.box("RAG BENCHMARK DASHBOARD", lines)
+        f"DB sizes         : {db_sizes}",
+        f"Search workload  : batch={args.batch_queries} runs={args.runs} warmup={args.warmup_batches} top_k={args.top_k}",
+        f"Build workload   : runs={args.build_runs} HNSW M={args.hnsw_m} efC={args.hnsw_ef_construction} efS={args.hnsw_ef}",
+        f"RAG workload     : workers={workers} runs={args.rag_runs} q/worker={args.rag_queries_per_worker} rag_db={args.rag_db_size}",
+        f"Workload hash    : {work_hash}",
+        f"System           : {sysinfo['cpu_count']} CPUs | L3 {sysinfo['l3_cache']} | RAM {sysinfo['memory_gb']} GB | WSL {sysinfo['is_wsl']}",
+    ])
 
 
 def print_summary(result: Dict[str, Any], ui: UI) -> None:
-    ui.rule("Benchmark output")
-    build_rows = []
-    for item in result.get("benchmarks", {}).get("index_build", []):
-        s = item["summary"]
-        build_rows.append([f"{item['db_size']:,}", item["index"], fmt_ms(s["mean_ms"]), fmt_ms(s["p95_ms"])])
-    if build_rows:
-        ui.table("Index build", ["DB size", "index", "mean", "p95"], build_rows)
+    label = result.get("meta", {}).get("label") or "this-system"
+    profile = result.get("meta", {}).get("profile", "")
+    sysinfo = result.get("system", {})
+    subtitle = f"{sysinfo.get('cpu','Unknown CPU')} | L3 {sysinfo.get('l3_cache','?')} | profile {profile} | workload {result.get('meta',{}).get('workload_hash','')}"
+    heads = result.get("headline", {})
+    db_label = int(heads.get("db_size", 100000)) // 1000
+    if heads.get("batch_search_qps") is not None:
+        ui.bar_chart(f"[x3d-rag-benchmark] Batch Search {db_label}K (QPS)", [(label, float(heads["batch_search_qps"]), "blue")], "qps", subtitle)
+    if heads.get("index_build_seconds") is not None:
+        ui.bar_chart(f"[x3d-rag-benchmark] Index Build {db_label}K (seconds)", [(label, float(heads["index_build_seconds"]), "red")], "s", subtitle, lower_is_better=True)
+        ui.bar_chart(f"[x3d-rag-benchmark] Index Build {db_label}K (vec/s)", [(label, float(heads.get("index_build_vec_per_s", 0.0)), "cyan")], "vec/s", subtitle)
+    if heads.get("rag_throughput_req_s") is not None:
+        ui.bar_chart("[x3d-rag-benchmark] Throughput (req/s)", [(label, float(heads["rag_throughput_req_s"]), "green")], "req/s", subtitle)
 
-    search_rows = []
-    for item in result.get("benchmarks", {}).get("vector_search", []):
-        q = item["qps"]
-        search_rows.append([f"{item['db_size']:,}", item["index"], f"{q['mean']:,.2f}", f"{q['cv_percent']:.2f}%", sparkline(q["runs"])])
-    if search_rows:
-        ui.table("Vector search", ["DB size", "index", "QPS mean", "CV", "runs"], search_rows)
-
-    rag = result.get("benchmarks", {}).get("rag", {})
+    rows: List[List[Any]] = []
+    if heads.get("batch_search_qps") is not None:
+        rows.append(["Batch Search", f"{heads['batch_search_qps']:,.2f} QPS", f"CV {heads.get('batch_search_cv_percent',0):.2f}%"])
+    if heads.get("index_build_seconds") is not None:
+        rows.append(["Index Build", f"{heads['index_build_seconds']:,.3f} s", f"{heads.get('index_build_vec_per_s',0):,.0f} vec/s"])
+    if heads.get("rag_throughput_req_s") is not None:
+        rows.append(["RAG Throughput", f"{heads['rag_throughput_req_s']:,.3f} req/s", f"completed {heads.get('rag_completed',0)} errors {heads.get('rag_errors',0)}"])
+    if rows:
+        ui.table("Headline metrics", ["metric", "value", "detail"], rows)
+    rag = result.get("benchmarks", {}).get("rag") or {}
     if rag:
-        rows = [
-            ["Completed", rag.get("completed", 0)],
-            ["Errors", rag.get("errors", 0)],
-            ["Requests/sec mean", fmt_num(rag.get("requests_per_second_mean", 0), 4)],
-            ["Approx tokens/sec", fmt_num(rag.get("approx_tokens_per_second_mean", 0), 3)],
-            ["Chars/sec", fmt_num(rag.get("chars_per_second_mean", 0), 3)],
-            ["TTFT p50/p95/p99", f"{fmt_ms(rag['ttft_latency']['p50_ms'])} / {fmt_ms(rag['ttft_latency']['p95_ms'])} / {fmt_ms(rag['ttft_latency']['p99_ms'])}"],
-            ["Total p50/p95/p99", f"{fmt_ms(rag['total_latency']['p50_ms'])} / {fmt_ms(rag['total_latency']['p95_ms'])} / {fmt_ms(rag['total_latency']['p99_ms'])}"],
-            ["Retrieval p50/p95", f"{fmt_ms(rag['retrieval_latency']['p50_ms'])} / {fmt_ms(rag['retrieval_latency']['p95_ms'])}"],
-            ["Throughput runs", sparkline(rag.get("requests_per_second_runs", []))],
-            ["Stream fallbacks", rag.get("stream_fallback_count", 0)],
-        ]
-        ui.table("Concurrent RAG", ["metric", "value"], rows)
+        ui.table("RAG latency", ["metric", "p50", "p95", "p99"], [
+            ["TTFT", f"{rag['ttft_latency']['p50_ms']:,.1f} ms", f"{rag['ttft_latency']['p95_ms']:,.1f} ms", f"{rag['ttft_latency']['p99_ms']:,.1f} ms"],
+            ["Total", f"{rag['total_latency']['p50_ms']:,.1f} ms", f"{rag['total_latency']['p95_ms']:,.1f} ms", f"{rag['total_latency']['p99_ms']:,.1f} ms"],
+            ["Retrieval", f"{rag['retrieval_latency']['p50_ms']:,.3f} ms", f"{rag['retrieval_latency']['p95_ms']:,.3f} ms", f"{rag['retrieval_latency']['p99_ms']:,.3f} ms"],
+        ])
         if rag.get("error_samples"):
             ui.print(ui.yellow("Error samples:"))
-            for sample in rag["error_samples"]:
-                ui.print("  - " + str(sample)[:240])
+            for e in rag["error_samples"]:
+                ui.print("  - " + str(e)[:240])
+    if result.get("output_path"):
+        ui.box("Saved result", [result["output_path"]])
 
-    out = result.get("output_path")
-    if out:
-        ui.box("Saved result", [str(out)])
+
+def make_headline(bench: Dict[str, Any], db_sizes: Sequence[int]) -> Dict[str, Any]:
+    target = int(db_sizes[0])
+    headline: Dict[str, Any] = {"db_size": target}
+    for item in bench.get("vector_search", []):
+        if int(item.get("db_size", -1)) == target:
+            headline["batch_search_qps"] = float(item["qps"]["mean"])
+            headline["batch_search_cv_percent"] = float(item["qps"]["cv_percent"])
+            break
+    for item in bench.get("index_build", []):
+        if int(item.get("db_size", -1)) == target:
+            headline["index_build_seconds"] = float(item["summary"]["mean_s"])
+            headline["index_build_vec_per_s"] = float(item["summary"]["vectors_per_s"])
+            headline["index_build_cv_percent"] = float(item["summary"]["cv_percent"])
+            break
+    rag = bench.get("rag") or {}
+    if rag:
+        headline["rag_throughput_req_s"] = float(rag["requests_per_second"]["mean"])
+        headline["rag_throughput_cv_percent"] = float(rag["requests_per_second"].get("cv_percent", 0.0))
+        headline["rag_completed"] = int(rag.get("completed", 0))
+        headline["rag_errors"] = int(rag.get("errors", 0))
+    return headline
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Deterministic X3D-style RAG benchmark for OpenAI-compatible endpoints")
+    p.add_argument("--endpoint", default=None)
+    p.add_argument("--model", default=None)
+    p.add_argument("--api-key", default=None)
+    p.add_argument("--profile", choices=["x3d-100k", "quick", "custom"], default="x3d-100k")
+    p.add_argument("--quick", action="store_true")
+    p.add_argument("--label", default=None)
+    p.add_argument("--output", default=None)
+    p.add_argument("--cache-dir", default=DEFAULT_CACHE_DIR)
+    p.add_argument("--index-backend", choices=["faiss", "auto", "numpy"], default="faiss")
+    p.add_argument("--db-sizes", default=None)
+    p.add_argument("--batch-queries", type=int, default=3000)
+    p.add_argument("--runs", type=int, default=10)
+    p.add_argument("--warmup-batches", type=int, default=5)
+    p.add_argument("--build-runs", type=int, default=5)
+    p.add_argument("--trim", type=float, default=0.05)
+    p.add_argument("--cooldown", type=float, default=2.0)
+    p.add_argument("--top-k", type=int, default=10)
+    p.add_argument("--hnsw-m", type=int, default=32)
+    p.add_argument("--hnsw-ef", type=int, default=64)
+    p.add_argument("--hnsw-ef-construction", type=int, default=200)
+    p.add_argument("--embedding-dim", type=int, default=384)
+    p.add_argument("--cluster-count", type=int, default=4096)
+    p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--query-seed", type=int, default=7331)
+    p.add_argument("--refresh-cache", action="store_true")
+    p.add_argument("--corpus", choices=["synthetic", "local-jsonl"], default="synthetic")
+    p.add_argument("--corpus-file", default=None)
+    p.add_argument("--corpus-license", default=None)
+    p.add_argument("--jsonl-text-key", default="text")
+    p.add_argument("--rag-workers", type=int, default=0)
+    p.add_argument("--rag-runs", type=int, default=5)
+    p.add_argument("--rag-queries-per-worker", type=int, default=20)
+    p.add_argument("--rag-db-size", type=int, default=10000)
+    p.add_argument("--max-tokens", type=int, default=48)
+    p.add_argument("--context-chars", type=int, default=900)
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--request-timeout", type=float, default=120.0)
+    p.add_argument("--request-seed", type=int, default=4242)
+    p.add_argument("--send-seed", action="store_true", help="Include seed in chat payload. Some OpenAI-compatible servers reject this; off by default.")
+    p.add_argument("--no-stream", action="store_true")
+    p.add_argument("--allow-stream-fallback", action="store_true", default=True)
+    p.add_argument("--skip-search", action="store_true")
+    p.add_argument("--skip-build", action="store_true")
+    p.add_argument("--skip-rag", action="store_true")
+    p.add_argument("--license-audit", action="store_true")
+    p.add_argument("--self-test", action="store_true")
+    p.add_argument("--plain", action="store_true")
+    return p
 
 
 def run(args: argparse.Namespace) -> Dict[str, Any]:
     ui = UI(args.plain)
+    if args.label is None:
+        args.label = socket.gethostname() or "this-system"
     if args.license_audit:
-        audit = license_audit(ui)
-        return {"license_audit": audit}
+        return {"version": VERSION, "license_audit": license_audit(ui)}
 
+    server = None
     if args.self_test:
         endpoint, server = start_mock_server()
         args.endpoint = endpoint
         args.model = "mock-rag-model"
-        args.quick = False
-        args.db_sizes = "256"
-        args.batch_queries = min(args.batch_queries, 64)
-        args.runs = min(args.runs, 2)
-        args.rag_workers = 2
-        args.rag_runs = 2
-        args.rag_queries_per_worker = 2
-        args.rag_db_size = 128
-        args.index_backend = "numpy" if args.index_backend == "auto" else args.index_backend
+        args.profile = "quick"
+        if args.index_backend == "faiss":
+            args.index_backend = "auto"
         args.output = args.output or str(Path.cwd() / "rag_benchmark_selftest_result.json")
-    else:
-        server = None
 
-    apply_quick_defaults(args)
-    db_sizes = parse_db_sizes(args.db_sizes)
+    apply_profile(args)
+    db_sizes = parse_db_sizes(args.db_sizes or "100000")
     max_db = max(max(db_sizes), args.rag_db_size)
     workers = args.rag_workers or min(os.cpu_count() or 1, 8)
-    q_count = max(args.batch_queries, workers * args.rag_queries_per_worker * max(1, args.rag_runs), 128)
+    q_count = max(args.batch_queries * (args.warmup_batches + args.runs), workers * args.rag_queries_per_worker, 512)
+    if args.corpus == "local-jsonl":
+        require_permissive(args.corpus_license)
     backend = choose_backend(args.index_backend)
     sysinfo = system_info()
 
-    try:
-        endpoint, model, endpoint_info = probe_endpoint(args, ui)
-        db_texts, q_texts, query_doc_ids, corpus_info = load_corpus(args, max_db, q_count, ui)
-        print_start_dashboard(args, ui, endpoint_info, corpus_info, backend, sysinfo)
-        license_info = license_audit(ui)
-        db_embeddings, q_embeddings, embedding_info = load_or_build_embeddings(args, db_texts, q_texts, corpus_info, ui)
+    base, model, endpoint_info = probe_endpoint(args, ui)
+    api_key = args.api_key if args.api_key is not None else os.environ.get("OPENAI_API_KEY", "")
+    wd = workload_dict(args, db_sizes, q_count, endpoint_model=model)
+    work_hash = stable_hash(wd, 16)
+    print_start(args, endpoint_info, backend, sysinfo, work_hash, ui)
+    license_info = license_audit(ui)
 
-        build_results = run_build_benchmark(args, db_embeddings, db_sizes, backend, ui)
-        search_results = run_search_benchmark(args, db_embeddings, q_embeddings, db_sizes, backend, ui)
-        rag_result = run_rag_benchmark(args, endpoint, model, db_texts, db_embeddings, q_texts, q_embeddings, backend, ui)
+    local_texts: Optional[List[str]] = None
+    if args.corpus == "synthetic":
+        db, q, qids, corpus_info = generate_synthetic_embeddings(args, max_db, q_count, ui)
+    else:
+        if not args.corpus_file:
+            raise SystemExit("--corpus-file is required when --corpus local-jsonl")
+        texts = load_local_jsonl(args.corpus_file, args.jsonl_text_key)
+        if len(texts) < max_db:
+            texts = (texts * ((max_db // len(texts)) + 1))[:max_db]
+        else:
+            texts = texts[:max_db]
+        local_texts = texts
+        q_texts = [texts[((i * 9973 + 17) % len(texts))] for i in range(q_count)]
+        db, q, qids, corpus_info = hashed_embeddings_for_local(args, texts, q_texts, ui)
 
-        output_path = args.output or f"rag_benchmark_result_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        result = {
-            "schema_version": 1,
-            "benchmark": "openai-compatible-rag-benchmark",
-            "version": VERSION,
-            "created_utc": now_utc_iso(),
-            "system": sysinfo,
-            "endpoint": endpoint_info,
-            "config": {
-                "db_sizes": db_sizes,
-                "batch_queries": args.batch_queries,
-                "runs": args.runs,
-                "trim": args.trim,
-                "top_k": args.top_k,
-                "hnsw_m": args.hnsw_m,
-                "hnsw_ef": args.hnsw_ef,
-                "hnsw_ef_construction": args.hnsw_ef_construction,
-                "index_backend": backend,
-                "rag_workers": workers,
-                "rag_runs": args.rag_runs,
-                "rag_queries_per_worker": args.rag_queries_per_worker,
-                "rag_db_size": args.rag_db_size,
-                "context_chars": args.context_chars,
-                "max_tokens": args.max_tokens,
+    bench: Dict[str, Any] = {}
+    bench["index_build"] = run_index_build(args, db, db_sizes, backend, ui)
+    bench["vector_search"] = run_batch_search(args, db, q, db_sizes, backend, ui)
+    bench["rag"] = run_rag(args, base, api_key, model, db, q, qids, backend, local_texts, ui)
+
+    headline = make_headline(bench, db_sizes)
+    now = _dt.datetime.now().astimezone()
+    result: Dict[str, Any] = {
+        "schema": "rag_benchmark.x3d_style.v1",
+        "version": VERSION,
+        "meta": {
+            "timestamp": now.isoformat(),
+            "label": args.label,
+            "profile": args.profile,
+            "workload_hash": work_hash,
+            "workload": wd,
+            "reproducibility": {
+                "deterministic_workload": True,
+                "fixed_seeds": {"seed": args.seed, "query_seed": args.query_seed, "request_seed": args.request_seed},
+                "fixed_query_slices": True,
                 "temperature": args.temperature,
-                "stream": not args.no_stream,
+                "note": "The retrieval/index workload is deterministic. Endpoint generation runtime can still vary with server scheduling and model implementation.",
             },
-            "license_audit": license_info,
+            "endpoint": endpoint_info,
             "corpus": corpus_info,
-            "query_doc_ids_sample": query_doc_ids[:20],
-            "embeddings": embedding_info,
-            "benchmarks": {
-                "index_build": build_results,
-                "vector_search": search_results,
-                "rag": rag_result,
-            },
-            "output_path": str(output_path),
-        }
-        Path(output_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
-        Path(output_path).expanduser().write_text(json.dumps(result, indent=2), encoding="utf-8")
-        print_summary(result, ui)
-        return result
-    finally:
-        if server is not None:
-            server.shutdown()
+            "license_audit": license_info,
+        },
+        "system": sysinfo,
+        "benchmarks": bench,
+        "headline": headline,
+    }
+    out = args.output or f"rag_benchmark_{now.strftime('%Y%m%d_%H%M%S')}.json"
+    out_path = Path(out).expanduser()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    result["output_path"] = str(out_path)
+    # Write output_path into the file too.
+    out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    print_summary(result, ui)
+    if server is not None:
+        server.shutdown()
+    return result
 
 
-def main(argv: Sequence[str]) -> int:
-    args = parse_args(argv)
+def main() -> None:
+    random.seed(1337)
+    parser = build_parser()
+    args = parser.parse_args()
     try:
         run(args)
-        return 0
     except KeyboardInterrupt:
-        print("\nInterrupted.", file=sys.stderr)
-        return 130
+        raise SystemExit("Interrupted")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
-PYTHON
+    main()
+PY
 
 "$PYTHON_BIN" "$RUNNER" "${PY_ARGS[@]}"
